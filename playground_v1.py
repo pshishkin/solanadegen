@@ -201,6 +201,8 @@ def get_token_metadata(mint_address):
     if mint_address is None:
         return 'None'
 
+    # metadata_account = get_metadata_account(mint_address)
+
     headers = {"Content-Type": "application/json"}
     body = {
         "jsonrpc": "2.0",
