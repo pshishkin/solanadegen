@@ -21,7 +21,7 @@ STOP_AFTER_FOUND_TXS = 10
 BUCKETS = 10000
 SAVE_LESS_THAN_BUCKET = 1000
 OLDEST_TX = datetime(2023, 11, 1, 0, 0)
-PROCESS_TRADE_LESS_THAN_BUCKET = 10
+PROCESS_TRADE_LESS_THAN_BUCKET = 100
 TRADES_BATCH = 100
 NODE_PARALLEL_REQUESTS = 5
 
@@ -127,7 +127,7 @@ def process_new_transactions(contract_address):
 
     while True:
         iteration += 1
-        new_transactions = get_transactions_from_node(contract_address, before=before)
+        new_transactions = retry_get_transactions_from_node(contract_address, before=before)
         print(f"Iteration {iteration}, {len(new_transactions)} txs, from {new_transactions[0]['ts']} to {new_transactions[-1]['ts']}")
 
         stored_txs = 0
@@ -182,7 +182,7 @@ def process_old_transactions(contract_address):
             print(f"Reached {OLDEST_TX}, stopping")
             break
 
-        old_transactions = get_transactions_from_node(contract_address, before=oldest_signature)
+        old_transactions = retry_get_transactions_from_node(contract_address, before=oldest_signature)
         print(f"Iteration {iteration}, {len(old_transactions)} txs, from {old_transactions[0]['ts']} to {old_transactions[-1]['ts']}")
 
         transaction_data = node_txs_to_db([tx for tx in old_transactions if tx['signature'] not in signatures_set])
@@ -461,7 +461,7 @@ if __name__ == "__main__":
             print("Invalid command. Use 'scan_new_txs' or 'scan_old_txs'.")
 
     else:
-        transaction_signatures = get_transactions_from_node(contract_address)
+        transaction_signatures = retry_get_transactions_from_node(contract_address)
 
         for sig in transaction_signatures:
             get_transaction_details(sig)
