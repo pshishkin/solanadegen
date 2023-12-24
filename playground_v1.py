@@ -21,9 +21,9 @@ STOP_AFTER_FOUND_TXS = 10
 BUCKETS = 10000
 SAVE_LESS_THAN_BUCKET = 1000
 OLDEST_TX = datetime(2023, 11, 1, 0, 0)
-PROCESS_TRADE_LESS_THAN_BUCKET = 100
+PROCESS_TRADE_LESS_THAN_BUCKET = 200
 TRADES_BATCH = 100
-NODE_PARALLEL_REQUESTS = 5
+NODE_PARALLEL_REQUESTS = 4
 
 
 def connect_to_db():
@@ -201,7 +201,6 @@ def get_token_metadata(mint_address):
     if mint_address is None:
         return 'None'
 
-    sleep(SLEEP_SEC)
     headers = {"Content-Type": "application/json"}
     body = {
         "jsonrpc": "2.0",
@@ -457,12 +456,9 @@ if __name__ == "__main__":
             process_old_transactions(contract_address)
         elif sys.argv[1] == 'process_trades':
             loop_process_trades()
+
         else:
             print("Invalid command. Use 'scan_new_txs' or 'scan_old_txs'.")
 
     else:
-        transaction_signatures = retry_get_transactions_from_node(contract_address)
-
-        for sig in transaction_signatures:
-            get_transaction_details(sig)
-            sleep(SLEEP_SEC)
+        transaction_signatures = get_token_metadata('mb1eu7TzEc71KxDpsmsKoucSSuuoGLv1drys1oP2jh6')
