@@ -1,3 +1,4 @@
+import functools
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime
@@ -26,6 +27,21 @@ PROCESS_TRADE_LESS_THAN_BUCKET = 200
 TRADES_BATCH = 100
 NODE_PARALLEL_REQUESTS = 7
 
+
+def retry_on_exception(exclude_exceptions=(KeyboardInterrupt,)):
+    def decorator(func):
+        @functools.wraps(func)
+        def wrapper(*args, **kwargs):
+            while True:
+                try:
+                    return func(*args, **kwargs)
+                except exclude_exceptions as e:
+                    raise e
+                except Exception as e:
+                    print(f"An exception occurred: {e}. Retrying...")
+                    sleep(10)  # Wait for 1 second before retrying
+        return wrapper
+    return decorator
 
 def connect_to_db():
     return psycopg2.connect(os.getenv('DATABASE_URL'))
@@ -110,7 +126,7 @@ def node_txs_to_db(txs):
 
 
 # Function to process and store transactions
-
+@retry_on_exception()
 def loop_process_new_transactions(contract_address):
     while True:
         process_new_transactions(contract_address)
@@ -166,6 +182,7 @@ def process_new_transactions(contract_address):
     conn.close()
 
 
+@retry_on_exception()
 def process_old_transactions(contract_address):
     conn = connect_to_db()
     cur = conn.cursor()
@@ -424,6 +441,7 @@ def apply_aggregated_trades(cur, aggregated_trades):
             """, (mint, day, agg_trade.trades, agg_trade.token_volume, agg_trade.usd_volume, agg_trade.sol_volume, agg_trade.sells, agg_trade.token_spent, agg_trade.usd_got, agg_trade.sol_got, agg_trade.purchases, agg_trade.token_got, agg_trade.usd_spent, agg_trade.sol_spent))
 
 
+@retry_on_exception()
 def loop_process_trades():
     while True:
         processed = process_trades()
