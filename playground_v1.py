@@ -136,6 +136,8 @@ def process_new_transactions(contract_address):
         kept_transactions = []
 
         for tx in new_transactions:
+            before = tx['signature']
+
             if tx['signature'] in existing_signatures:
                 skipped_txs += 1
                 found_existing_txs += 1
@@ -144,7 +146,6 @@ def process_new_transactions(contract_address):
                 continue
 
             kept_transactions.append(tx)
-            before = tx['signature']
 
         transaction_data = node_txs_to_db(kept_transactions)
         stored_txs += len(transaction_data)

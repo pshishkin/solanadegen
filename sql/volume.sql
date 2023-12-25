@@ -6,3 +6,5 @@ select count(*), sum(trades), sum(usd_volume + sol_volume * 50) from daily_trade
 with
 t1 as (select mint from daily_trades group by mint)
 select count(*) from t1;
+
+select count(*) from transactions;
