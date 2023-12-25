@@ -10,8 +10,9 @@ import psycopg2
 from dotenv import load_dotenv
 import os
 from psycopg2.extras import execute_batch
+import logging
 
-
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 load_dotenv()
 
 SLEEP_SEC = 0
@@ -128,7 +129,7 @@ def process_new_transactions(contract_address):
     while True:
         iteration += 1
         new_transactions = retry_get_transactions_from_node(contract_address, before=before)
-        print(f"Iteration {iteration}, {len(new_transactions)} txs, from {new_transactions[0]['ts']} to {new_transactions[-1]['ts']}")
+        logging.info(f"Iteration {iteration}, {len(new_transactions)} txs, from {new_transactions[0]['ts']} to {new_transactions[-1]['ts']}")
 
         stored_txs = 0
         skipped_txs = 0
@@ -155,10 +156,10 @@ def process_new_transactions(contract_address):
 
         conn.commit()
 
-        print(f"Iteration {iteration}, stored {stored_txs}, skipped {skipped_txs}")
+        logging.info(f"Iteration {iteration}, stored {stored_txs}, skipped {skipped_txs}")
 
         if found_existing_txs > STOP_AFTER_FOUND_TXS:
-            print(f"Iteration {iteration}, stopped after {STOP_AFTER_FOUND_TXS} found transactions")
+            logging.info(f"Iteration {iteration}, stopped after {STOP_AFTER_FOUND_TXS} found transactions")
             break
 
     cur.close()
@@ -169,22 +170,24 @@ def process_old_transactions(contract_address):
     conn = connect_to_db()
     cur = conn.cursor()
     iteration = 0
+    oldest_signature = ''
 
     while True:
         iteration += 1
         oldest_txs = get_oldest_tx(cur)
         if not oldest_txs:
             return
-        oldest_signature = oldest_txs[0]['signature']
+        if not oldest_signature:
+            oldest_signature = oldest_txs[0]['signature']
         oldest_ts = oldest_txs[0]['ts']
         signatures_set = {tx['signature'] for tx in oldest_txs}
 
         if oldest_ts < OLDEST_TX:
-            print(f"Reached {OLDEST_TX}, stopping")
+            logging.info(f"Reached {OLDEST_TX}, stopping")
             break
 
         old_transactions = retry_get_transactions_from_node(contract_address, before=oldest_signature)
-        print(f"Iteration {iteration}, {len(old_transactions)} txs, from {old_transactions[0]['ts']} to {old_transactions[-1]['ts']}")
+        logging.info(f"Iteration {iteration}, {len(old_transactions)} txs, from {old_transactions[0]['ts']} to {old_transactions[-1]['ts']}")
 
         transaction_data = node_txs_to_db([tx for tx in old_transactions if tx['signature'] not in signatures_set])
 
@@ -192,7 +195,8 @@ def process_old_transactions(contract_address):
             insert_transactions(cur, transaction_data)
 
         conn.commit()
-        print(f"Iteration {iteration}, stored {len(transaction_data)}")
+        logging.info(f"Iteration {iteration}, stored {len(transaction_data)}")
+        oldest_signature = old_transactions[-1]['signature']
 
     cur.close()
     conn.close()
@@ -212,7 +216,7 @@ def get_token_metadata(mint_address):
         "params": [mint_address, {"encoding": "jsonParsed"}]
     }
     response = requests.post(NODE_URL, json=body, headers=headers)
-    print(response.json())
+    logging.info(response.json())
     result = response.json().get('result', {})
     metadata = result.get('value', {}).get('data', {}).get('parsed', {}).get('info', {})
     return metadata.get('name', '???')
@@ -257,7 +261,7 @@ def get_transaction_details(tx):
     block_time = result.get('blockTime')
     transaction_status = result.get('meta', {}).get('err')
     if transaction_status is not None:
-        print(f"Transaction {signature} failed with error: {transaction_status}")
+        logging.info(f"Transaction {signature} failed with error: {transaction_status}")
         raise Exception(f"Transaction {signature} failed with error: {transaction_status}")
     initiator = result['transaction']['message']['accountKeys'][0].get('pubkey')
 
@@ -316,12 +320,12 @@ def get_transaction_details(tx):
 
     # if tokens_transfers:
     #
-    #     print(f"Transaction Signature: {signature}, Block Time: {block_time}, Initiator: {initiator}")
+    #     logging.info(f"Transaction Signature: {signature}, Block Time: {block_time}, Initiator: {initiator}")
     #     for tt in tokens_transfers:
-    #         print(f"Token Delta: {tt['delta']}, Mint: {tt['mint']}")
-    #     print(f"USD Delta: {usd_delta}")
-    #     print(f"SOL Delta: {sol_delta}")
-    #     print()
+    #         logging.info(f"Token Delta: {tt['delta']}, Mint: {tt['mint']}")
+    #     logging.info(f"USD Delta: {usd_delta}")
+    #     logging.info(f"SOL Delta: {sol_delta}")
+    #     logging.info()
 
     return {
         'signature': tx['signature'],
@@ -432,16 +436,16 @@ def process_trades():
     cur = conn.cursor()
     txs = get_unprocessed_transactions(cur)
     if len(txs) == 0:
-        print("No transactions to process")
+        logging.info("No transactions to process")
         return 0
-    print(f"Processing {len(txs)} transactions, from {txs[0]['ts']} to {txs[-1]['ts']}")
+    logging.info(f"Processing {len(txs)} transactions, from {txs[0]['ts']} to {txs[-1]['ts']}")
     trades = extract_trades(txs)
-    print(f"Found {len(trades)} trades")
+    logging.info(f"Found {len(trades)} trades")
     aggregated_trades = aggregate_trades(trades)
-    print(f"Got {len(aggregated_trades)} aggregated trades from {len(trades)} trades")
+    logging.info(f"Got {len(aggregated_trades)} aggregated trades from {len(trades)} trades")
     mark_tx_as_processed(cur, txs)
     apply_aggregated_trades(cur, aggregated_trades)
-    print(f"Saved to DB")
+    logging.info(f"Saved to DB")
     conn.commit()
     cur.close()
     conn.close()
@@ -461,7 +465,7 @@ if __name__ == "__main__":
             loop_process_trades()
 
         else:
-            print("Invalid command. Use 'scan_new_txs' or 'scan_old_txs'.")
+            logging.info("Invalid command. Use 'scan_new_txs' or 'scan_old_txs'.")
 
     else:
         transaction_signatures = get_token_metadata('mb1eu7TzEc71KxDpsmsKoucSSuuoGLv1drys1oP2jh6')
