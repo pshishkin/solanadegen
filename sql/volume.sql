@@ -13,5 +13,5 @@ select count(*) from transactions;
 
 
 SELECT signature, timestamp, bucket FROM transactions
-    WHERE processed = FALSE AND bucket < 100
+    WHERE processed = FALSE AND bucket < 200
     ORDER BY timestamp DESC limit 100;
