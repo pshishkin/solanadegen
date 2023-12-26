@@ -29,3 +29,22 @@ CREATE TABLE daily_trades (
     PRIMARY KEY (mint, day)
 );
 
+CREATE TABLE trades (
+    signature VARCHAR(100) PRIMARY KEY,
+    mint VARCHAR(50),
+    timestamp TIMESTAMP,
+    trades INT,
+    token_volume FLOAT,
+    usd_volume FLOAT,
+    sol_volume FLOAT,
+    sells INT,
+    token_spent FLOAT,
+    usd_got FLOAT,
+    sol_got FLOAT,
+    purchases INT,
+    token_got FLOAT,
+    usd_spent FLOAT,
+    sol_spent FLOAT
+);
+
+CREATE INDEX idx_mint ON trades (mint, timestamp);

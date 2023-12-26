@@ -1,4 +1,5 @@
 import functools
+import traceback
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime
@@ -10,7 +11,7 @@ import requests
 import psycopg2
 from dotenv import load_dotenv
 import os
-from psycopg2.extras import execute_batch
+from psycopg2.extras import execute_batch, execute_values
 import logging
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -38,7 +39,9 @@ def retry_on_exception(exclude_exceptions=(KeyboardInterrupt,)):
                 except exclude_exceptions as e:
                     raise e
                 except Exception as e:
+                    traceback.print_exc()
                     print(f"An exception occurred: {e}. Retrying...")
+                    # print stacktrace
                     sleep(10)  # Wait for 1 second before retrying
         return wrapper
     return decorator
@@ -109,7 +112,7 @@ def get_unprocessed_transactions(cur, batch_size=TRADES_BATCH):
     query = """
     SELECT signature, timestamp FROM transactions 
     WHERE processed = FALSE AND bucket < %s 
-    ORDER BY timestamp DESC 
+    --ORDER BY timestamp DESC 
     LIMIT %s
     """
     cur.execute(query, (PROCESS_TRADE_LESS_THAN_BUCKET, batch_size,))
@@ -379,8 +382,6 @@ def aggregate_trades(trades):
     aggregated_trades: dict[Any, Trade] = {}
     for trade in trades:
         day = trade['ts'].date()
-        if len(trade['transfers']) != 1:
-            continue
         transfer = trade['transfers'][0]
         if transfer['delta'] == 0:
             continue
@@ -441,6 +442,59 @@ def apply_aggregated_trades(cur, aggregated_trades):
             """, (mint, day, agg_trade.trades, agg_trade.token_volume, agg_trade.usd_volume, agg_trade.sol_volume, agg_trade.sells, agg_trade.token_spent, agg_trade.usd_got, agg_trade.sol_got, agg_trade.purchases, agg_trade.token_got, agg_trade.usd_spent, agg_trade.sol_spent))
 
 
+def parse_trade(trade):
+    parsed_trade = Trade()
+    parsed_trade.trades = 1
+    parsed_trade.token_volume = abs(trade['transfers'][0]['delta'])
+    parsed_trade.usd_volume = abs(trade['usd_delta'])
+    parsed_trade.sol_volume = abs(trade['sol_delta'])
+
+    if trade['transfers'][0]['delta'] > 0:
+        # Buy
+        parsed_trade.purchases = 1
+        parsed_trade.token_got = trade['transfers'][0]['delta']
+        parsed_trade.usd_spent = -trade['usd_delta']
+        parsed_trade.sol_spent = -trade['sol_delta']
+    else:
+        # Sell
+        parsed_trade.sells = 1
+        parsed_trade.token_spent = -trade['transfers'][0]['delta']
+        parsed_trade.usd_got = trade['usd_delta']
+        parsed_trade.sol_got = trade['sol_delta']
+
+    return (
+        trade['signature'],
+        trade['transfers'][0]['mint'],
+        trade['ts'],
+        parsed_trade.trades,
+        parsed_trade.token_volume,
+        parsed_trade.usd_volume,
+        parsed_trade.sol_volume,
+        parsed_trade.sells,
+        parsed_trade.token_spent,
+        parsed_trade.usd_got,
+        parsed_trade.sol_got,
+        parsed_trade.purchases,
+        parsed_trade.token_got,
+        parsed_trade.usd_spent,
+        parsed_trade.sol_spent,
+    )
+
+
+def apply_individual_trades(cur, trades):
+    trade_values = [parse_trade(trade) for trade in trades]
+
+    insert_query = """
+    INSERT INTO trades (
+        signature, mint, timestamp, trades, token_volume, usd_volume, sol_volume,
+        sells, token_spent, usd_got, sol_got, purchases, token_got, usd_spent, sol_spent
+    ) VALUES %s ON CONFLICT (signature) DO NOTHING
+    """
+
+    # Using psycopg2's execute_values for bulk insert
+    execute_values(cur, insert_query, trade_values)
+
+
 @retry_on_exception()
 def loop_process_trades():
     while True:
@@ -458,13 +512,18 @@ def process_trades():
         return 0
     logging.info(f"Processing {len(txs)} transactions, from {txs[0]['ts']} to {txs[-1]['ts']}")
     trades = extract_trades(txs)
+    trades = [t for t in trades if len(t['transfers']) == 1]
     logging.info(f"Found {len(trades)} trades")
     aggregated_trades = aggregate_trades(trades)
     logging.info(f"Got {len(aggregated_trades)} aggregated trades from {len(trades)} trades")
     mark_tx_as_processed(cur, txs)
+    logging.info(f"Mark as processed")
+    apply_individual_trades(cur, trades)
+    logging.info(f"Applied individual trades")
     apply_aggregated_trades(cur, aggregated_trades)
-    logging.info(f"Saved to DB")
+    logging.info(f"Applied aggregated trades")
     conn.commit()
+    logging.info(f"Saved to DB")
     cur.close()
     conn.close()
     return len(txs)
