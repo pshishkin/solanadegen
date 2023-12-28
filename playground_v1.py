@@ -1,3 +1,4 @@
+import asyncio
 import functools
 import traceback
 from concurrent.futures import ThreadPoolExecutor
@@ -6,6 +7,8 @@ from datetime import datetime
 import sys
 from time import sleep
 from typing import Any
+from telegram import ForceReply, Update
+from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 
 import requests
 import psycopg2
@@ -20,6 +23,7 @@ load_dotenv()
 SLEEP_SEC = 0
 # url is like NODE_URL=https://solana-mainnet.g.alchemy.com/v2/...
 NODE_URL = os.getenv('NODE_URL')
+TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN')
 STOP_AFTER_FOUND_TXS = 10
 BUCKETS = 10000
 SAVE_LESS_THAN_BUCKET = 1000
@@ -495,6 +499,88 @@ def apply_individual_trades(cur, trades):
     execute_values(cur, insert_query, trade_values)
 
 
+def add_subscriber(chat_id):
+    conn = connect_to_db()
+    cur = conn.cursor()
+    try:
+        cur.execute("INSERT INTO subscribers (chat_id) VALUES (%s) ON CONFLICT DO NOTHING", (chat_id,))
+        conn.commit()
+    finally:
+        cur.close()
+        conn.close()
+
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    add_subscriber(update.message.chat_id)
+    await update.message.reply_html(
+        rf"Hi {user.mention_html()}! I'll send you hyping degen bots as soon as they appear.",
+        reply_markup=ForceReply(selective=True),
+    )
+
+
+@retry_on_exception()
+def loop_process_bot_subscriptions():
+    application = Application.builder().token(TELEGRAM_TOKEN).build()
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, start))
+    application.run_polling(allowed_updates=Update.ALL_TYPES)
+
+
+def get_subscribers(cur):
+    cur.execute("SELECT chat_id FROM subscribers")
+    subscribers = {row[0] for row in cur.fetchall()}
+    return subscribers
+
+
+broadcast_mints_query = """
+SELECT dt.mint, min(dt.day) as first_trade_day
+FROM daily_trades dt
+WHERE dt.mint NOT IN (SELECT mint FROM broadcasted_tokens)
+GROUP BY dt.mint
+HAVING SUM(dt.trades) * 325 > 30000
+LIMIT 1
+"""
+
+
+def get_hyping_mints_for_broadcast(cur):
+    cur.execute(broadcast_mints_query)
+    mints = {(row[0], row[1]) for row in cur.fetchall()}
+    return mints
+
+
+def mark_mints_as_broadcasted(cur, conn, mints):
+    query = "INSERT INTO broadcasted_tokens (mint) VALUES %s ON CONFLICT DO NOTHING"
+    execute_values(cur, query, [(mint[0],) for mint in mints])
+    conn.commit()
+
+
+@retry_on_exception()
+async def loop_process_bot_broadcasts():
+    application = Application.builder().token(TELEGRAM_TOKEN).build()
+    conn = connect_to_db()
+    cur = conn.cursor()
+
+    try:
+        while True:
+            subscribers = get_subscribers(cur)
+            mints = get_hyping_mints_for_broadcast(cur)
+            logging.info(f"Got {len(mints)} mints to broadcast")
+            for s in subscribers:
+                for m in mints:
+                    await application.bot.send_message(
+                        chat_id=s,
+                        text=f"Token {m[0][:5]}...{m[0][-5:]} is hyping since {m[1]}\n[Ape into it!](https://jup.ag/swap/USDC-{m[0]})",
+                        disable_web_page_preview=True,
+                        parse_mode='Markdown'
+                    )
+            mark_mints_as_broadcasted(cur, conn, mints)
+            sleep(60)
+    finally:
+        cur.close()
+        conn.close()
+
+
 @retry_on_exception()
 def loop_process_trades():
     while True:
@@ -536,7 +622,10 @@ if __name__ == "__main__":
             process_old_transactions(contract_address)
         elif sys.argv[1] == 'process_trades':
             loop_process_trades()
-
+        elif sys.argv[1] == 'bot_start':
+            loop_process_bot_subscriptions()
+        elif sys.argv[1] == 'bot_broadcast':
+            asyncio.run(loop_process_bot_broadcasts())
         else:
             logging.info("Invalid command. Use 'scan_new_txs' or 'scan_old_txs'.")
 

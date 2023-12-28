@@ -48,3 +48,11 @@ CREATE TABLE trades (
 );
 
 CREATE INDEX idx_mint ON trades (mint, timestamp);
+
+CREATE TABLE subscribers (
+    chat_id BIGINT PRIMARY KEY
+);
+
+CREATE TABLE broadcasted_tokens (
+    mint VARCHAR(50) PRIMARY KEY
+);
