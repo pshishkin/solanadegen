@@ -575,7 +575,7 @@ async def loop_process_bot_broadcasts():
                         parse_mode='Markdown'
                     )
             mark_mints_as_broadcasted(cur, conn, mints)
-            sleep(60)
+            sleep(10)
     finally:
         cur.close()
         conn.close()
