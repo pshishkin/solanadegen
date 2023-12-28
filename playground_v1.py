@@ -515,8 +515,21 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     add_subscriber(update.message.chat_id)
     await update.message.reply_html(
         rf"Hi {user.mention_html()}! I'll send you hyping degen bots as soon as they appear.",
-        reply_markup=ForceReply(selective=True),
     )
+
+    conn = connect_to_db()
+    cur = conn.cursor()
+    mints = get_freshest_hyping_mints(cur)
+    logging.info(f"Got {len(mints)} mints to send")
+    text = "A few freshest hyping tokens:\n"
+    for m in mints:
+        text += f"[{m[0][:5]}...{m[0][-5:]}](https://solscan.io/token/{m[0]}) since {m[1]} [Ape](https://jup.ag/swap/USDC-{m[0]})!\n"
+    await update.message.reply_markdown(
+        text=text,
+        disable_web_page_preview=True,
+    )
+    cur.close()
+    conn.close()
 
 
 @retry_on_exception()
@@ -545,7 +558,23 @@ LIMIT 1
 
 def get_hyping_mints_for_broadcast(cur):
     cur.execute(broadcast_mints_query)
-    mints = {(row[0], row[1]) for row in cur.fetchall()}
+    mints = [(row[0], row[1]) for row in cur.fetchall()]
+    return mints
+
+
+freshest_mints_query = """
+SELECT dt.mint, min(dt.day) as first_trade_day
+FROM daily_trades dt
+GROUP BY dt.mint
+HAVING SUM(dt.trades) * 325 > 30000
+order by 2 desc
+LIMIT 10
+"""
+
+
+def get_freshest_hyping_mints(cur):
+    cur.execute(freshest_mints_query)
+    mints = [(row[0], row[1]) for row in cur.fetchall()]
     return mints
 
 
@@ -570,7 +599,7 @@ async def loop_process_bot_broadcasts():
                 for m in mints:
                     await application.bot.send_message(
                         chat_id=s,
-                        text=f"Token {m[0][:5]}...{m[0][-5:]} is hyping since {m[1]}\n[Ape into it!](https://jup.ag/swap/USDC-{m[0]})",
+                        text=f"Token [{m[0][:5]}...{m[0][-5:]}](https://solscan.io/token/{m[0]}) is hyping since {m[1]}\n[Ape into it!](https://jup.ag/swap/USDC-{m[0]})",
                         disable_web_page_preview=True,
                         parse_mode='Markdown'
                     )
