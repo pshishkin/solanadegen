@@ -2,7 +2,8 @@ CREATE TABLE transactions (
     signature VARCHAR(100) PRIMARY KEY,
     timestamp TIMESTAMP,
     bucket INT,
-    processed BOOLEAN DEFAULT FALSE
+    processed BOOLEAN DEFAULT FALSE,
+    processed_single BOOLEAN DEFAULT FALSE
 );
 
 CREATE INDEX idx_timestamp ON transactions (timestamp);

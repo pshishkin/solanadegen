@@ -11,6 +11,7 @@ select count(*) from t1;
 
 select count(*) from transactions;
 
+select * from transactions where timestamp < TIMESTAMP '2023-12-12' limit 10;
 
 SELECT signature, timestamp, bucket FROM transactions
     WHERE processed = FALSE AND bucket < 200

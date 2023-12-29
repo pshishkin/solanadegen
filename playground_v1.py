@@ -29,7 +29,7 @@ BUCKETS = 10000
 SAVE_LESS_THAN_BUCKET = 1000
 OLDEST_TX = datetime(2023, 11, 1, 0, 0)
 PROCESS_TRADE_LESS_THAN_BUCKET = 200
-TRADES_BATCH = 300
+TRADES_BATCH = 100
 NODE_PARALLEL_REQUESTS = 7
 
 
@@ -117,6 +117,18 @@ def get_unprocessed_transactions(cur, batch_size=TRADES_BATCH):
     SELECT signature, timestamp FROM transactions 
     WHERE processed = FALSE AND bucket < %s 
     --ORDER BY timestamp DESC 
+    LIMIT %s
+    """
+    cur.execute(query, (PROCESS_TRADE_LESS_THAN_BUCKET, batch_size,))
+    return [{'signature': row[0], 'ts': row[1]} for row in cur.fetchall()]
+
+
+def get_unprocessed_individual_transactions(cur, batch_size=TRADES_BATCH):
+    query = """
+    SELECT signature, timestamp FROM transactions 
+    WHERE processed = TRUE AND bucket < %s AND processed_single = FALSE
+    AND timestamp < TIMESTAMP '2023-12-27' 
+    ORDER BY timestamp DESC 
     LIMIT %s
     """
     cur.execute(query, (PROCESS_TRADE_LESS_THAN_BUCKET, batch_size,))
@@ -425,6 +437,12 @@ def mark_tx_as_processed(cur, txs):
     cur.execute(update_query, (transaction_signatures,))
 
 
+def mark_tx_as_individual_processed(cur, txs):
+    update_query = "UPDATE transactions SET processed_single = TRUE WHERE signature = ANY(%s)"
+    transaction_signatures = [tx['signature'] for tx in txs]
+    cur.execute(update_query, (transaction_signatures,))
+
+
 def apply_aggregated_trades(cur, aggregated_trades):
     for (mint, day), agg_trade in aggregated_trades.items():
         cur.execute("""
@@ -618,6 +636,33 @@ def loop_process_trades():
             sleep(10)
 
 
+@retry_on_exception()
+def loop_process_individual_trades():
+    while True:
+        processed = process_individual_trades()
+        if processed == 0:
+            break
+
+
+def process_individual_trades():
+    conn = connect_to_db()
+    cur = conn.cursor()
+    txs = get_unprocessed_individual_transactions(cur)
+    if len(txs) == 0:
+        logging.info("No transactions to process")
+        return 0
+    logging.info(f"Processing {len(txs)} transactions, from {txs[0]['ts']} to {txs[-1]['ts']}")
+    trades = extract_trades(txs)
+    trades = [t for t in trades if len(t['transfers']) == 1]
+    mark_tx_as_individual_processed(cur, txs)
+    apply_individual_trades(cur, trades)
+    conn.commit()
+    logging.info(f"Saved to DB")
+    cur.close()
+    conn.close()
+    return len(txs)
+
+
 def process_trades():
     conn = connect_to_db()
     cur = conn.cursor()
@@ -651,6 +696,8 @@ if __name__ == "__main__":
             process_old_transactions(contract_address)
         elif sys.argv[1] == 'process_trades':
             loop_process_trades()
+        elif sys.argv[1] == 'process_individual_trades':
+            loop_process_individual_trades()
         elif sys.argv[1] == 'bot_start':
             loop_process_bot_subscriptions()
         elif sys.argv[1] == 'bot_broadcast':
