@@ -2,13 +2,17 @@ CREATE TABLE transactions (
     signature VARCHAR(100) PRIMARY KEY,
     timestamp TIMESTAMP,
     bucket INT,
-    processed BOOLEAN DEFAULT FALSE,
-    processed_single BOOLEAN DEFAULT FALSE
+    processed BOOLEAN DEFAULT FALSE
 );
+
+alter table transactions add column processed BOOLEAN DEFAULT FALSE;
+
+-- get indices for transactions
+\di *.[transactions]*
 
 select count(*) from transactions where bucket < 2 and processed = true;
 
-update transactions set processed = false where bucket <= 200 and processed = true;
+select * from transactions where bucket <= 200 and processed = true;
 
 CREATE INDEX idx_timestamp ON transactions (timestamp);
 

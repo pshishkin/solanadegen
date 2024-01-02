@@ -122,8 +122,7 @@ def get_unprocessed_individual_transactions(cur, batch_size=TRADES_BATCH):
     SELECT signature, timestamp FROM transactions 
     WHERE processed = FALSE 
     AND bucket < %s
-    and bucket > 200 
-    and timestamp < now() - interval '1 minute'
+    and timestamp < now() - interval '3 minute'
     ORDER BY timestamp DESC 
     LIMIT %s
     """
