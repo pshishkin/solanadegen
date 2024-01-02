@@ -268,7 +268,7 @@ def retry_get_transaction_details(tx):
         try:
             return get_transaction_details(tx)
         except RateLimitException:
-            sleep(0.7)
+            sleep(1.1)
 
 
 def get_transaction_details(tx):
