@@ -120,7 +120,10 @@ def insert_transactions(cur, transactions):
 def get_unprocessed_individual_transactions(cur, batch_size=TRADES_BATCH):
     query = """
     SELECT signature, timestamp FROM transactions 
-    WHERE processed = FALSE AND bucket < %s
+    WHERE processed = FALSE 
+    AND bucket < %s
+    and bucket > 200 
+    and timestamp < now() - interval '1 minute'
     ORDER BY timestamp DESC 
     LIMIT %s
     """

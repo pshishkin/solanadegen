@@ -6,7 +6,9 @@ CREATE TABLE transactions (
     processed_single BOOLEAN DEFAULT FALSE
 );
 
-update transactions set processed = false;
+select count(*) from transactions where bucket < 2 and processed = true;
+
+update transactions set processed = false where bucket <= 200 and processed = true;
 
 CREATE INDEX idx_timestamp ON transactions (timestamp);
 
