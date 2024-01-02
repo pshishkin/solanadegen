@@ -1,5 +1,6 @@
 import asyncio
 import functools
+import random
 import traceback
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -22,15 +23,19 @@ load_dotenv()
 
 SLEEP_SEC = 0
 # url is like NODE_URL=https://solana-mainnet.g.alchemy.com/v2/...
-NODE_URL = os.getenv('NODE_URL')
+NODE_URLS = [os.getenv('NODE_URL_1'), os.getenv('NODE_URL_2')]
 TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN')
 STOP_AFTER_FOUND_TXS = 10
 BUCKETS = 10000
 SAVE_LESS_THAN_BUCKET = 1000
 OLDEST_TX = datetime(2023, 11, 1, 0, 0)
-PROCESS_TRADE_LESS_THAN_BUCKET = 200
-TRADES_BATCH = 100
-NODE_PARALLEL_REQUESTS = 7
+PROCESS_TRADE_LESS_THAN_BUCKET = 1000
+TRADES_BATCH = 300
+NODE_PARALLEL_REQUESTS = 20
+
+
+def get_node_url():
+    return random.choice(NODE_URLS)
 
 
 def retry_on_exception(exclude_exceptions=(KeyboardInterrupt,)):
@@ -78,7 +83,7 @@ def get_transactions_from_node(contract_address, limit=1000, before=''):
     if before:
         body['params'][1]['before'] = before
 
-    response = requests.post(NODE_URL, json=body, headers=headers)
+    response = requests.post(get_node_url(), json=body, headers=headers)
     transactions = response.json().get('result', [])
 
     # Filter out transactions with errors
@@ -112,22 +117,10 @@ def insert_transactions(cur, transactions):
     execute_batch(cur, query, transactions)
 
 
-def get_unprocessed_transactions(cur, batch_size=TRADES_BATCH):
-    query = """
-    SELECT signature, timestamp FROM transactions 
-    WHERE processed = FALSE AND bucket < %s 
-    --ORDER BY timestamp DESC 
-    LIMIT %s
-    """
-    cur.execute(query, (PROCESS_TRADE_LESS_THAN_BUCKET, batch_size,))
-    return [{'signature': row[0], 'ts': row[1]} for row in cur.fetchall()]
-
-
 def get_unprocessed_individual_transactions(cur, batch_size=TRADES_BATCH):
     query = """
     SELECT signature, timestamp FROM transactions 
-    WHERE processed = TRUE AND bucket < %s AND processed_single = FALSE
-    AND timestamp < TIMESTAMP '2023-12-27' 
+    WHERE processed = FALSE AND bucket < %s
     ORDER BY timestamp DESC 
     LIMIT %s
     """
@@ -251,7 +244,7 @@ def get_token_metadata(mint_address):
         "method": "getAccountInfo",
         "params": [mint_address, {"encoding": "jsonParsed"}]
     }
-    response = requests.post(NODE_URL, json=body, headers=headers)
+    response = requests.post(get_node_url(), json=body, headers=headers)
     logging.info(response.json())
     result = response.json().get('result', {})
     metadata = result.get('value', {}).get('data', {}).get('parsed', {}).get('info', {})
@@ -275,7 +268,7 @@ def retry_get_transaction_details(tx):
         try:
             return get_transaction_details(tx)
         except RateLimitException:
-            sleep(1)
+            sleep(0.7)
 
 
 def get_transaction_details(tx):
@@ -287,10 +280,11 @@ def get_transaction_details(tx):
         "method": "getTransaction",
         "params": [signature, {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 0}]
     }
-    response = requests.post(NODE_URL, json=body, headers=headers)
+    response = requests.post(get_node_url(), json=body, headers=headers)
     result = response.json().get('result', {})
     if not result:
-        if 'Your app has exceeded its compute units per second capacity' in str(response.json()):
+        if 'Your app has exceeded its compute units per second capacity' in str(response.json()) or \
+                'credits limited to' in str(response.json()):
             raise RateLimitException(f"Rate limit exceeded for {signature}")
         raise Exception(response.json())
 
@@ -315,7 +309,6 @@ def get_transaction_details(tx):
     } for b in result.get('meta', {}).get('postTokenBalances', [])}
 
     tokens_transfers = []
-    usd_delta = 0.
     sol_delta = 0.
 
     # Calculate and display non-zero deltas of token balances for the transaction initiator
@@ -332,13 +325,6 @@ def get_transaction_details(tx):
             mint_address = pre_token_balances[index].get('mint')
             # token_name = get_token_metadata(mint_address)
             if mint_address in [
-                'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v',
-                'USDH1SM1ojwWUga67PGrgFWUHibbjqMvuMaDkRJTgkX',
-                'Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB',
-                'A1KLoBrKBde8Ty9qtNQUtq3C2ortoC3u7twggz7sEto6',
-            ]:
-                usd_delta += delta
-            elif mint_address in [
                 'So11111111111111111111111111111111111111112',
             ]:
                 sol_delta += delta
@@ -351,23 +337,19 @@ def get_transaction_details(tx):
             post_sol_balance = convert_to_float(result.get('meta', {}).get('postBalances', [])[i])
             sol_delta += (post_sol_balance - pre_sol_balance) / 10 ** 9
 
-    if abs(sol_delta) < 0.001:
+    if abs(sol_delta) < 0.01:
         sol_delta = 0
 
-    # if tokens_transfers:
-    #
+    # if tokens_transfers and len(tokens_transfers) >= 1:
     #     logging.info(f"Transaction Signature: {signature}, Block Time: {block_time}, Initiator: {initiator}")
     #     for tt in tokens_transfers:
     #         logging.info(f"Token Delta: {tt['delta']}, Mint: {tt['mint']}")
-    #     logging.info(f"USD Delta: {usd_delta}")
     #     logging.info(f"SOL Delta: {sol_delta}")
-    #     logging.info()
 
     return {
         'signature': tx['signature'],
         'ts': tx['ts'],
         'transfers': tokens_transfers,
-        'usd_delta': usd_delta,
         'sol_delta': sol_delta,
     }
 
@@ -379,56 +361,22 @@ def extract_trades(txs):
 
 
 @dataclass
-class Trade:
-    trades: int = 0
-    token_volume: float = 0.
-    usd_volume: float = 0.
-    sol_volume: float = 0.
-    sells: int = 0
-    token_spent: float = 0.
-    usd_got: float = 0.
-    sol_got: float = 0.
-    purchases: int = 0
-    token_got: float = 0.
-    usd_spent: float = 0.
-    sol_spent: float = 0.
+class SolTrade:
+    signature: str = ''
+    mint: str = ''
+    timestamp: datetime = None
+    token_delta: float = 0.
+    sol_delta: float = 0.
 
 
-def aggregate_trades(trades):
-    aggregated_trades: dict[Any, Trade] = {}
-    for trade in trades:
-        day = trade['ts'].date()
-        transfer = trade['transfers'][0]
-        if transfer['delta'] == 0:
-            continue
-        if trade['sol_delta'] == 0 and trade['usd_delta'] == 0:
-            continue
-
-        mint = transfer['mint']
-        key = (mint, day)
-
-        agg_trade = aggregated_trades.get(key, Trade())
-
-        agg_trade.trades += 1
-        agg_trade.token_volume += abs(transfer['delta'])
-        agg_trade.usd_volume += abs(trade['usd_delta'])
-        agg_trade.sol_volume += abs(trade['sol_delta'])
-
-        if transfer['delta'] > 0:
-            # Buy
-            agg_trade.purchases += 1
-            agg_trade.token_got += transfer['delta']
-            agg_trade.usd_spent -= trade['usd_delta']
-            agg_trade.sol_spent -= trade['sol_delta']
-        else:
-            # Sell
-            agg_trade.sells += 1
-            agg_trade.token_spent -= transfer['delta']
-            agg_trade.usd_got += trade['usd_delta']
-            agg_trade.sol_got += trade['sol_delta']
-
-        aggregated_trades[key] = agg_trade
-    return aggregated_trades
+class TokenTrade:
+    signature: str = ''
+    timestamp: datetime = None
+    mint_spent: str = ''
+    amount_spent: float = 0.
+    mint_got: str = ''
+    amount_got: float = 0.
+    sol_delta: float = 0.
 
 
 def mark_tx_as_processed(cur, txs):
@@ -437,85 +385,85 @@ def mark_tx_as_processed(cur, txs):
     cur.execute(update_query, (transaction_signatures,))
 
 
-def mark_tx_as_individual_processed(cur, txs):
-    update_query = "UPDATE transactions SET processed_single = TRUE WHERE signature = ANY(%s)"
-    transaction_signatures = [tx['signature'] for tx in txs]
-    cur.execute(update_query, (transaction_signatures,))
+def parse_sol_trade(trade):
+    assert (len(trade['transfers']) == 1)
+    parsed_trade = SolTrade()
+    parsed_trade.signature = trade['signature']
+    parsed_trade.mint = trade['transfers'][0]['mint']
+    parsed_trade.timestamp = trade['ts']
+    parsed_trade.token_delta = trade['transfers'][0]['delta']
+    parsed_trade.sol_delta = trade['sol_delta']
 
-
-def apply_aggregated_trades(cur, aggregated_trades):
-    for (mint, day), agg_trade in aggregated_trades.items():
-        cur.execute("""
-            INSERT INTO daily_trades (mint, day, trades, token_volume, usd_volume, sol_volume, sells, token_spent, usd_got, sol_got, purchases, token_got, usd_spent, sol_spent)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-            ON CONFLICT (mint, day) DO UPDATE SET
-            trades = daily_trades.trades + EXCLUDED.trades,
-            token_volume = daily_trades.token_volume + EXCLUDED.token_volume,
-            usd_volume = daily_trades.usd_volume + EXCLUDED.usd_volume,
-            sol_volume = daily_trades.sol_volume + EXCLUDED.sol_volume,
-            sells = daily_trades.sells + EXCLUDED.sells,
-            token_spent = daily_trades.token_spent + EXCLUDED.token_spent,
-            usd_got = daily_trades.usd_got + EXCLUDED.usd_got,
-            sol_got = daily_trades.sol_got + EXCLUDED.sol_got,
-            purchases = daily_trades.purchases + EXCLUDED.purchases,
-            token_got = daily_trades.token_got + EXCLUDED.token_got,
-            usd_spent = daily_trades.usd_spent + EXCLUDED.usd_spent,
-            sol_spent = daily_trades.sol_spent + EXCLUDED.sol_spent
-            """, (mint, day, agg_trade.trades, agg_trade.token_volume, agg_trade.usd_volume, agg_trade.sol_volume, agg_trade.sells, agg_trade.token_spent, agg_trade.usd_got, agg_trade.sol_got, agg_trade.purchases, agg_trade.token_got, agg_trade.usd_spent, agg_trade.sol_spent))
-
-
-def parse_trade(trade):
-    parsed_trade = Trade()
-    parsed_trade.trades = 1
-    parsed_trade.token_volume = abs(trade['transfers'][0]['delta'])
-    parsed_trade.usd_volume = abs(trade['usd_delta'])
-    parsed_trade.sol_volume = abs(trade['sol_delta'])
-
-    if trade['transfers'][0]['delta'] > 0:
-        # Buy
-        parsed_trade.purchases = 1
-        parsed_trade.token_got = trade['transfers'][0]['delta']
-        parsed_trade.usd_spent = -trade['usd_delta']
-        parsed_trade.sol_spent = -trade['sol_delta']
-    else:
-        # Sell
-        parsed_trade.sells = 1
-        parsed_trade.token_spent = -trade['transfers'][0]['delta']
-        parsed_trade.usd_got = trade['usd_delta']
-        parsed_trade.sol_got = trade['sol_delta']
+    if abs(parsed_trade.sol_delta) == 0.:
+        return None
 
     return (
-        trade['signature'],
-        trade['transfers'][0]['mint'],
-        trade['ts'],
-        parsed_trade.trades,
-        parsed_trade.token_volume,
-        parsed_trade.usd_volume,
-        parsed_trade.sol_volume,
-        parsed_trade.sells,
-        parsed_trade.token_spent,
-        parsed_trade.usd_got,
-        parsed_trade.sol_got,
-        parsed_trade.purchases,
-        parsed_trade.token_got,
-        parsed_trade.usd_spent,
-        parsed_trade.sol_spent,
+        parsed_trade.signature,
+        parsed_trade.mint,
+        parsed_trade.timestamp,
+        parsed_trade.token_delta,
+        parsed_trade.sol_delta,
     )
 
 
-def apply_individual_trades(cur, trades):
-    trade_values = [parse_trade(trade) for trade in trades]
+def parse_token_trade(trade):
+    assert (len(trade['transfers']) == 2)
+    parsed_trade = TokenTrade()
+
+    parsed_trade.signature = trade['signature']
+    parsed_trade.mint = trade['transfers'][0]['mint']
+    parsed_trade.timestamp = trade['ts']
+
+    if trade['transfers'][0]['delta'] > 0 and trade['transfers'][1]['delta'] < 0:
+        parsed_trade.mint_got = trade['transfers'][0]['mint']
+        parsed_trade.amount_got = trade['transfers'][0]['delta']
+        parsed_trade.mint_spent = trade['transfers'][1]['mint']
+        parsed_trade.amount_spent = -trade['transfers'][1]['delta']
+    elif trade['transfers'][0]['delta'] < 0 and trade['transfers'][1]['delta'] > 0:
+        parsed_trade.mint_got = trade['transfers'][1]['mint']
+        parsed_trade.amount_got = trade['transfers'][1]['delta']
+        parsed_trade.mint_spent = trade['transfers'][0]['mint']
+        parsed_trade.amount_spent = -trade['transfers'][0]['delta']
+    else:
+        return None
+
+    return (
+        parsed_trade.signature,
+        parsed_trade.timestamp,
+        parsed_trade.mint_spent,
+        parsed_trade.amount_spent,
+        parsed_trade.mint_got,
+        parsed_trade.amount_got,
+        parsed_trade.sol_delta,
+    )
+
+
+def apply_sol_trades(cur, trades):
+    trade_values = [parse_sol_trade(trade) for trade in trades]
+    trade_values = [tv for tv in trade_values if tv is not None]
 
     insert_query = """
-    INSERT INTO trades (
-        signature, mint, timestamp, trades, token_volume, usd_volume, sol_volume,
-        sells, token_spent, usd_got, sol_got, purchases, token_got, usd_spent, sol_spent
+    INSERT INTO sol_trades (
+        signature, mint, timestamp, token_delta, sol_delta
     ) VALUES %s ON CONFLICT (signature) DO NOTHING
     """
 
     # Using psycopg2's execute_values for bulk insert
     execute_values(cur, insert_query, trade_values)
 
+
+def apply_token_trades(cur, trades):
+    trade_values = [parse_token_trade(trade) for trade in trades]
+    trade_values = [tv for tv in trade_values if tv is not None]
+
+    insert_query = """
+    INSERT INTO token_trades (
+        signature, timestamp, mint_spent, amount_spent, mint_got, amount_got, sol_delta
+    ) VALUES %s ON CONFLICT (signature) DO NOTHING
+    """
+
+    # Using psycopg2's execute_values for bulk insert
+    execute_values(cur, insert_query, trade_values)
 
 def add_subscriber(chat_id):
     conn = connect_to_db()
@@ -629,14 +577,6 @@ async def loop_process_bot_broadcasts():
 
 
 @retry_on_exception()
-def loop_process_trades():
-    while True:
-        processed = process_trades()
-        if processed < 5:
-            sleep(10)
-
-
-@retry_on_exception()
 def loop_process_individual_trades():
     while True:
         processed = process_individual_trades()
@@ -645,6 +585,7 @@ def loop_process_individual_trades():
 
 
 def process_individual_trades():
+    logging.info(f"Getting unprocessed transactions from DB")
     conn = connect_to_db()
     cur = conn.cursor()
     txs = get_unprocessed_individual_transactions(cur)
@@ -653,31 +594,13 @@ def process_individual_trades():
         return 0
     logging.info(f"Processing {len(txs)} transactions, from {txs[0]['ts']} to {txs[-1]['ts']}")
     trades = extract_trades(txs)
-    trades = [t for t in trades if len(t['transfers']) == 1]
-    mark_tx_as_individual_processed(cur, txs)
-    apply_individual_trades(cur, trades)
-    conn.commit()
-    logging.info(f"Saved to DB")
-    cur.close()
-    conn.close()
-    return len(txs)
 
-
-def process_trades():
-    conn = connect_to_db()
-    cur = conn.cursor()
-    txs = get_unprocessed_transactions(cur)
-    if len(txs) == 0:
-        logging.info("No transactions to process")
-        return 0
-    logging.info(f"Processing {len(txs)} transactions, from {txs[0]['ts']} to {txs[-1]['ts']}")
-    trades = extract_trades(txs)
-    trades = [t for t in trades if len(t['transfers']) == 1]
-    aggregated_trades = aggregate_trades(trades)
-    logging.info(f"Got {len(aggregated_trades)} aggregated trades from {len(trades)} trades")
+    sol_trades = [t for t in trades if len(t['transfers']) == 1]
+    token_trades = [t for t in trades if len(t['transfers']) == 2]
+    logging.info(f"Saving to DB {len(trades)} trades: {len(sol_trades)} SOL trades, {len(token_trades)} token trades")
+    apply_sol_trades(cur, sol_trades)
+    apply_token_trades(cur, token_trades)
     mark_tx_as_processed(cur, txs)
-    apply_individual_trades(cur, trades)
-    apply_aggregated_trades(cur, aggregated_trades)
     conn.commit()
     logging.info(f"Saved to DB")
     cur.close()
@@ -694,8 +617,6 @@ if __name__ == "__main__":
             loop_process_new_transactions(contract_address)
         elif sys.argv[1] == 'scan_old_txs':
             process_old_transactions(contract_address)
-        elif sys.argv[1] == 'process_trades':
-            loop_process_trades()
         elif sys.argv[1] == 'process_individual_trades':
             loop_process_individual_trades()
         elif sys.argv[1] == 'bot_start':
