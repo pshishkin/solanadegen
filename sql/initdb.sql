@@ -17,6 +17,10 @@ select * from transactions where bucket <= 200 and processed = true;
 CREATE INDEX idx_timestamp ON transactions (timestamp);
 
 CREATE INDEX idx_bucket_timestamp ON transactions (bucket, processed, timestamp);
+drop index idx_bucket_timestamp;
+
+CREATE INDEX idx_processed_timestamp ON transactions (processed, timestamp);
+
 
 
 
