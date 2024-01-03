@@ -353,6 +353,7 @@ def get_transaction_details(tx):
         'ts': tx['ts'],
         'transfers': tokens_transfers,
         'sol_delta': sol_delta,
+        'trader': initiator,
     }
 
 
@@ -365,14 +366,17 @@ def extract_trades(txs):
 @dataclass
 class SolTrade:
     signature: str = ''
+    trader: str = ''
     mint: str = ''
     timestamp: datetime = None
     token_delta: float = 0.
     sol_delta: float = 0.
 
 
+@dataclass
 class TokenTrade:
     signature: str = ''
+    trader: str = ''
     timestamp: datetime = None
     mint_spent: str = ''
     amount_spent: float = 0.
@@ -391,6 +395,7 @@ def parse_sol_trade(trade):
     assert (len(trade['transfers']) == 1)
     parsed_trade = SolTrade()
     parsed_trade.signature = trade['signature']
+    parsed_trade.trader = trade['trader']
     parsed_trade.mint = trade['transfers'][0]['mint']
     parsed_trade.timestamp = trade['ts']
     parsed_trade.token_delta = trade['transfers'][0]['delta']
@@ -401,6 +406,7 @@ def parse_sol_trade(trade):
 
     return (
         parsed_trade.signature,
+        parsed_trade.trader,
         parsed_trade.mint,
         parsed_trade.timestamp,
         parsed_trade.token_delta,
@@ -413,6 +419,7 @@ def parse_token_trade(trade):
     parsed_trade = TokenTrade()
 
     parsed_trade.signature = trade['signature']
+    parsed_trade.trader = trade['trader']
     parsed_trade.mint = trade['transfers'][0]['mint']
     parsed_trade.timestamp = trade['ts']
 
@@ -431,6 +438,7 @@ def parse_token_trade(trade):
 
     return (
         parsed_trade.signature,
+        parsed_trade.trader,
         parsed_trade.timestamp,
         parsed_trade.mint_spent,
         parsed_trade.amount_spent,
@@ -446,8 +454,14 @@ def apply_sol_trades(cur, trades):
 
     insert_query = """
     INSERT INTO sol_trades (
-        signature, mint, timestamp, token_delta, sol_delta
-    ) VALUES %s ON CONFLICT (signature) DO NOTHING
+        signature, trader, mint, timestamp, token_delta, sol_delta
+    ) VALUES %s ON CONFLICT (signature) 
+    DO UPDATE SET 
+        trader = EXCLUDED.trader, 
+        mint = EXCLUDED.mint, 
+        timestamp = EXCLUDED.timestamp, 
+        token_delta = EXCLUDED.token_delta, 
+        sol_delta = EXCLUDED.sol_delta
     """
 
     # Using psycopg2's execute_values for bulk insert
@@ -460,8 +474,16 @@ def apply_token_trades(cur, trades):
 
     insert_query = """
     INSERT INTO token_trades (
-        signature, timestamp, mint_spent, amount_spent, mint_got, amount_got, sol_delta
-    ) VALUES %s ON CONFLICT (signature) DO NOTHING
+        signature, trader, timestamp, mint_spent, amount_spent, mint_got, amount_got, sol_delta
+    ) VALUES %s ON CONFLICT (signature) 
+    DO UPDATE SET 
+        trader = EXCLUDED.trader, 
+        timestamp = EXCLUDED.timestamp, 
+        mint_spent = EXCLUDED.mint_spent, 
+        amount_spent = EXCLUDED.amount_spent, 
+        mint_got = EXCLUDED.mint_got, 
+        amount_got = EXCLUDED.amount_got, 
+        sol_delta = EXCLUDED.sol_delta
     """
 
     # Using psycopg2's execute_values for bulk insert

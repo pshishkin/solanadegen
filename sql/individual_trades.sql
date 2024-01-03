@@ -1,6 +1,10 @@
-select * from sol_trades;
+select * from sol_trades order by timestamp desc;
 
-select * from token_trades;
+select count(*) from sol_trades;
+
+select * from token_trades order by timestamp desc;
+
+select count(*) from token_trades;
 
 
 select count(*), date_trunc('day', timestamp) from trades group by 2 order by 2 desc;

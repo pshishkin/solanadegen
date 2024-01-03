@@ -73,6 +73,7 @@ CREATE TABLE broadcasted_tokens (
 
 CREATE TABLE sol_trades (
     signature VARCHAR(100) PRIMARY KEY,
+    trader VARCHAR(50),
     mint VARCHAR(50),
     timestamp TIMESTAMP,
     token_delta FLOAT,
@@ -85,6 +86,7 @@ CREATE INDEX idx_sol_trades_2 ON sol_trades (timestamp);
 
 CREATE TABLE token_trades (
     signature VARCHAR(100) PRIMARY KEY,
+    trader VARCHAR(50),
     timestamp TIMESTAMP,
     mint_spent VARCHAR(50),
     amount_spent FLOAT,
