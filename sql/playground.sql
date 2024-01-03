@@ -2,10 +2,22 @@ select * from sol_trades order by timestamp desc;
 
 select count(*) from sol_trades;
 
+-- select where array size of program_ids > 1
+select * from sol_trades
+         where program_ids[2] is not null
+         order by timestamp desc;
+
+select * from token_trades
+         where signature = '5bx43SGzxvF8nKKrn7MVQFAEan7yg9ZJCtRXvQq3FvVR8HUrKa9pTELk5xBpvmEMQoq7eUikPmohbcWnoio4isnv';
+
 select * from token_trades order by timestamp desc;
 
 select count(*) from token_trades;
 
+-- select where array size of program_ids > 1
+select * from token_trades
+         where program_ids[2] is not null
+         order by timestamp desc;
 
 select count(*), date_trunc('day', timestamp) from trades group by 2 order by 2 desc;
 

@@ -1,4 +1,4 @@
-CREATE VIEW hourly_prices_final_view AS
+CREATE OR REPLACE VIEW hourly_prices_final_view AS
 
 with hourly_raw_volumes as (
     select
@@ -9,6 +9,9 @@ with hourly_raw_volumes as (
         count(*) as num_trades
     from
         sol_trades
+    where
+        abs(sol_delta) > 0.1
+        and abs(token_delta) > 0.01
     group by 1, 2
     order by 1 desc, 2
 ),

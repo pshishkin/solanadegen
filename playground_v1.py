@@ -342,14 +342,23 @@ def get_transaction_details(tx):
     if abs(sol_delta) < 0.01:
         sol_delta = 0
 
+    instructions = result.get('transaction', {}).get('message', {}).get('instructions', [])
+    program_ids = [i.get('programId') for i in instructions if i.get('programId') and i.get('accounts', [])]
+
     # if tokens_transfers and len(tokens_transfers) >= 1:
     #     logging.info(f"Transaction Signature: {signature}, Block Time: {block_time}, Initiator: {initiator}")
     #     for tt in tokens_transfers:
     #         logging.info(f"Token Delta: {tt['delta']}, Mint: {tt['mint']}")
     #     logging.info(f"SOL Delta: {sol_delta}")
 
+    # if tokens_transfers and len(tokens_transfers) >= 1 and len(program_ids) > 1:
+    #     logging.info(f"Transaction Signature: {signature}, Block Time: {block_time}, Initiator: {initiator}")
+    #     logging.info(f"Program IDs: {program_ids}")
+    #     logging.info("")
+
     return {
         'signature': tx['signature'],
+        'program_ids': program_ids,
         'ts': tx['ts'],
         'transfers': tokens_transfers,
         'sol_delta': sol_delta,
@@ -366,6 +375,7 @@ def extract_trades(txs):
 @dataclass
 class SolTrade:
     signature: str = ''
+    program_ids: list[str] = None
     trader: str = ''
     mint: str = ''
     timestamp: datetime = None
@@ -376,6 +386,7 @@ class SolTrade:
 @dataclass
 class TokenTrade:
     signature: str = ''
+    program_ids: list[str] = None
     trader: str = ''
     timestamp: datetime = None
     mint_spent: str = ''
@@ -395,6 +406,7 @@ def parse_sol_trade(trade):
     assert (len(trade['transfers']) == 1)
     parsed_trade = SolTrade()
     parsed_trade.signature = trade['signature']
+    parsed_trade.program_ids = trade['program_ids']
     parsed_trade.trader = trade['trader']
     parsed_trade.mint = trade['transfers'][0]['mint']
     parsed_trade.timestamp = trade['ts']
@@ -406,6 +418,7 @@ def parse_sol_trade(trade):
 
     return (
         parsed_trade.signature,
+        "{" + ",".join(parsed_trade.program_ids) + "}",
         parsed_trade.trader,
         parsed_trade.mint,
         parsed_trade.timestamp,
@@ -419,6 +432,7 @@ def parse_token_trade(trade):
     parsed_trade = TokenTrade()
 
     parsed_trade.signature = trade['signature']
+    parsed_trade.program_ids = trade['program_ids']
     parsed_trade.trader = trade['trader']
     parsed_trade.mint = trade['transfers'][0]['mint']
     parsed_trade.timestamp = trade['ts']
@@ -438,6 +452,7 @@ def parse_token_trade(trade):
 
     return (
         parsed_trade.signature,
+        "{" + ",".join(parsed_trade.program_ids) + "}",
         parsed_trade.trader,
         parsed_trade.timestamp,
         parsed_trade.mint_spent,
@@ -454,9 +469,10 @@ def apply_sol_trades(cur, trades):
 
     insert_query = """
     INSERT INTO sol_trades (
-        signature, trader, mint, timestamp, token_delta, sol_delta
+        signature, program_ids, trader, mint, timestamp, token_delta, sol_delta
     ) VALUES %s ON CONFLICT (signature) 
     DO UPDATE SET 
+        program_ids = EXCLUDED.program_ids,
         trader = EXCLUDED.trader, 
         mint = EXCLUDED.mint, 
         timestamp = EXCLUDED.timestamp, 
@@ -474,9 +490,10 @@ def apply_token_trades(cur, trades):
 
     insert_query = """
     INSERT INTO token_trades (
-        signature, trader, timestamp, mint_spent, amount_spent, mint_got, amount_got, sol_delta
+        signature, program_ids, trader, timestamp, mint_spent, amount_spent, mint_got, amount_got, sol_delta
     ) VALUES %s ON CONFLICT (signature) 
     DO UPDATE SET 
+        program_ids = EXCLUDED.program_ids,
         trader = EXCLUDED.trader, 
         timestamp = EXCLUDED.timestamp, 
         mint_spent = EXCLUDED.mint_spent, 

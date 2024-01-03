@@ -5,10 +5,9 @@ CREATE TABLE transactions (
     processed BOOLEAN DEFAULT FALSE
 );
 
+alter table transactions drop column processed;
 alter table transactions add column processed BOOLEAN DEFAULT FALSE;
 
--- get indices for transactions
-\di *.[transactions]*
 
 select count(*) from transactions where bucket < 2 and processed = true;
 
@@ -73,6 +72,7 @@ CREATE TABLE broadcasted_tokens (
 
 CREATE TABLE sol_trades (
     signature VARCHAR(100) PRIMARY KEY,
+    program_ids VARCHAR(50)[],
     trader VARCHAR(50),
     mint VARCHAR(50),
     timestamp TIMESTAMP,
@@ -80,12 +80,14 @@ CREATE TABLE sol_trades (
     sol_delta FLOAT
 );
 
+
 CREATE INDEX idx_sol_trades_1 ON sol_trades (mint, timestamp);
 CREATE INDEX idx_sol_trades_2 ON sol_trades (timestamp);
 
 
 CREATE TABLE token_trades (
     signature VARCHAR(100) PRIMARY KEY,
+    program_ids VARCHAR(50)[],
     trader VARCHAR(50),
     timestamp TIMESTAMP,
     mint_spent VARCHAR(50),
