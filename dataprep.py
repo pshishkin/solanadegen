@@ -1,0 +1,464 @@
+import os
+import psycopg2
+import pandas as pd
+from dotenv import load_dotenv
+import logging
+from datetime import timedelta
+from typing import Dict
+import numpy as np
+from dataclasses import dataclass
+from datetime import datetime, timedelta
+
+
+
+# Change it together only
+TIME_QUANTIZATION = '10min'
+QUANT_TIMEDELTA = timedelta(minutes=10)
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+
+class DatasetBuilder:
+    def __init__(self, rows_limit: int, prediction_timedelta: timedelta, change_magnitude: float):
+        self.rows_limit = rows_limit
+        self.prediction_timedelta = prediction_timedelta
+        self.change_magnitude = change_magnitude
+        self.price_tables = None
+        self.dataset = None
+
+    def build_dataset(self):
+        trades_df = get_db_df(self.rows_limit)
+        trades_df = filter_by_program_id(trades_df)
+        logging.info(f'Using memory: {trades_df.memory_usage(deep=True).sum() / 1024 ** 2} MB')
+        add_time_quantization(trades_df)
+        trades_df = remove_rare_tokens(trades_df)
+        trades_df = remove_latest_and_first_quant(trades_df)
+        price_tables = get_price_tables(trades_df)
+        self.price_tables = price_tables
+        dataset = get_dataset_keys(trades_df)
+        assign_labels(dataset, price_tables, self.prediction_timedelta, self.change_magnitude)
+        feature_calculator = FeatureCalculator(dataset, price_tables, trades_df, periods=14)
+        feature_calculator.assign_features()
+        dataset.sort_values(by=['time_quant', 'mint'], inplace=True)
+        dataset.reset_index(drop=True, inplace=True)
+        self.dataset = dataset
+        return dataset
+
+    def reassign_values(self, prediction_timedelta: timedelta, change_magnitude: float):
+        self.prediction_timedelta = prediction_timedelta
+        self.change_magnitude = change_magnitude
+        assign_labels(self.dataset, self.price_tables, self.prediction_timedelta, self.change_magnitude)
+        return self.dataset
+
+def get_db_df(rows_limit):
+    logging.info('Getting data from db')
+
+    load_dotenv()
+
+    conn = psycopg2.connect(os.getenv('DATABASE_URL'))
+
+    # Open a cursor to perform database operations
+    cur = conn.cursor()
+
+    # Execute a query
+    cur.execute(f"""
+    SELECT * FROM united_trades
+    where 
+    abs(sol_delta) > 0.03
+    and source = 'sol'
+    --abs(sol_delta) > 0.01
+    --and abs(token_delta) > 0.01
+    order by timestamp desc 
+    limit {rows_limit}
+    """)
+
+    # Retrieve query results
+    records = cur.fetchall()
+
+    # Convert to pandas DataFrame
+    df_from_db = pd.DataFrame(records, columns=[desc[0] for desc in cur.description])
+
+    # Close communication with the database
+    cur.close()
+    conn.close()
+
+    logging.info(f'Got {len(df_from_db)} records from db')
+    logging.info(f'From {df_from_db.timestamp.min()} to {df_from_db.timestamp.max()}')
+
+    return df_from_db
+
+
+def filter_by_program_id(df_from_db):
+    # The value to filter by, wrapped in a list to match the column's data type
+    value_to_filter = ['JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4']
+    # Use the `.apply()` method with a lambda function to check for equality
+    filtered_df = df_from_db[df_from_db['program_ids'].apply(lambda x: x == value_to_filter)]
+    logging.info(f'Filtered df by program_id, got {len(filtered_df)} records')
+    return filtered_df
+
+
+def add_time_quantization(trades_df):
+    trades_df['time_quant'] = trades_df['timestamp'].dt.floor('10min')
+
+
+def remove_rare_tokens(trades_df, min_trades=20, min_quants=5):
+    # mints that appears in at least 10 trades
+    mints_counts = trades_df.groupby('mint').size()
+    mints_with_n_trades = mints_counts[mints_counts >= min_trades].index
+    # print(mints_with_10_trades)
+    # mints that appears in at least 3 pairs (mint, time_quant)
+    keys_counts = trades_df.groupby(['mint', 'time_quant']).size()
+    mints_with_n_quants = keys_counts[keys_counts >= min_quants].index.get_level_values(0).unique()
+    # print(mints_with_3_pairs)
+    # intersection of these mints
+    mints_to_keep = mints_with_n_trades.intersection(mints_with_n_quants)
+
+    # # sum of abs of sol_delta for each mint
+    # mints_sol_delta = trades_df.groupby('mint')['sol_delta'].abs().agg('sum')
+    # # mints that have at least 5 sol traded
+    #
+
+    # filter df by these mints
+    logging.info('Before rare tokens filtering %d trades, %d mints', len(trades_df), trades_df.mint.nunique())
+    trades_df = trades_df[trades_df.mint.isin(mints_to_keep)]
+    logging.info('After rare tokens filtering %d trades, %d mints', len(trades_df), trades_df.mint.nunique())
+
+    return trades_df
+
+
+def remove_latest_and_first_quant(trades_df):
+    min_quant = trades_df.time_quant.min()
+    max_quant = trades_df.time_quant.max()
+    trades_df = trades_df[trades_df.time_quant != min_quant]
+    trades_df = trades_df[trades_df.time_quant != max_quant]
+    return trades_df
+
+
+class PriceTables:
+    quants: pd.DatetimeIndex
+    sol_prices: Dict[str, np.array]
+    united_prices: Dict[str, np.array]
+    buy_volumes: Dict[str, np.array]
+    sell_volumes: Dict[str, np.array]
+
+    def __init__(self, sol_prices, united_prices, buy_volumes, sell_volumes, quants):
+        self.sol_prices = sol_prices
+        self.united_prices = united_prices
+        self.buy_volumes = buy_volumes
+        self.sell_volumes = sell_volumes
+        self.quants = quants
+
+    def get_price(self, mint, quant, price_type):
+        quant_index_float = (quant - self.quants[0]) / QUANT_TIMEDELTA
+        # convert to int, but check that it's close to integer
+        quant_index = round(quant_index_float)
+        if abs(quant_index_float - quant_index) > 0.01:
+            raise ValueError(f'Quant {quant} is not close to quantization')
+
+        if quant_index < 0 or quant_index >= len(self.quants):
+            return -1
+
+        if price_type == 'sol':
+            return self.sol_prices[mint][quant_index]
+        elif price_type == 'united':
+            return self.united_prices[mint][quant_index]
+        else:
+            raise ValueError(f'Unknown price type: {price_type}')
+
+    def get_volume(self, mint, quant, price_type):
+        quant_index_float = (quant - self.quants[0]) / QUANT_TIMEDELTA
+        # convert to int, but check that it's close to integer
+        quant_index = round(quant_index_float)
+        if abs(quant_index_float - quant_index) > 0.01:
+            raise ValueError(f'Quant {quant} is not close to quantization')
+
+        if quant_index < 0 or quant_index >= len(self.quants):
+            return -1
+
+        if price_type == 'buy':
+            return self.buy_volumes[mint][quant_index]
+        elif price_type == 'sell':
+            return self.sell_volumes[mint][quant_index]
+        elif price_type == 'sum':
+            return self.buy_volumes[mint][quant_index] + self.sell_volumes[mint][quant_index]
+        else:
+            raise ValueError(f'Unknown volume type: {price_type}')
+
+
+def get_exponential_price_average(df, alpha=0.5) -> float:
+    # calculates exponential moving average of price,
+    # with sol_delta / token_delta as price,
+    # and sol_delta as weight
+    prices = abs(df.sol_delta / df.token_delta)
+    weights = abs(df.sol_delta)
+    # multiply weight exponentially
+    exp = (1 - alpha) ** np.arange(len(df))
+    # reverse last series
+    exp = exp[::-1]
+    # multiply weight by exp and make sum equal to 1
+    weights = weights * exp
+    weights = weights / weights.sum()
+    # calc weighted average price
+    price = (prices * weights).sum()
+    return price
+
+
+def get_buy_sell_volume(df) -> (float, float):
+    buy_volume = 0.
+    sell_volume = 0.
+
+    for i, row in df.iterrows():
+        if row['sol_delta'] > 0:
+            sell_volume += row['sol_delta']
+        if row['sol_delta'] < 0:
+            buy_volume += -row['sol_delta']
+
+    return buy_volume, sell_volume
+
+def get_price_tables(trades_df) -> PriceTables:
+    min_quant = trades_df.time_quant.min()
+    max_quant = trades_df.time_quant.max()
+    global_quants = pd.date_range(min_quant, max_quant, freq=TIME_QUANTIZATION)
+    quants_len = len(global_quants)
+
+    trades_df.sort_values(by=['mint', 'time_quant'], inplace=True)
+    sol_prices = {}
+    united_prices = {}
+    buy_volumes = {}
+    sell_volumes = {}
+
+    for mint in trades_df.mint.unique():
+        sol_prices[mint] = np.zeros(quants_len)
+        united_prices[mint] = np.zeros(quants_len)
+        buy_volumes[mint] = np.zeros(quants_len)
+        sell_volumes[mint] = np.zeros(quants_len)
+
+        mint_df = trades_df[trades_df.mint == mint]
+        mint_df.set_index('time_quant', inplace=True)
+        last_sol_price = 0.
+        last_united_price = 0.
+        buy_volume_cumsum = 0.
+        sell_volume_cumsum = 0.
+        quants_in_df = mint_df.index.unique()
+        for i, quant in enumerate(global_quants):
+            if quant in quants_in_df:
+                # mint_quant_df = mint_df[['source', 'sol_delta', 'token_delta']].loc[[quant]]
+                mint_quant_df = mint_df.loc[[quant]]
+                last_united_price = get_exponential_price_average(mint_quant_df)
+                buy_volume, sell_volume = get_buy_sell_volume(mint_quant_df)
+                buy_volume_cumsum += buy_volume
+                sell_volume_cumsum += sell_volume
+                # get only sol trades which means source is 'sol
+                sol_df = mint_quant_df[mint_quant_df['source'] == 'sol']
+                # if it's non-empty, calc price
+                if len(sol_df) > 0:
+                    last_sol_price = get_exponential_price_average(sol_df)
+            sol_prices[mint][i] = last_sol_price
+            united_prices[mint][i] = last_united_price
+            buy_volumes[mint][i] = buy_volume_cumsum
+            sell_volumes[mint][i] = sell_volume_cumsum
+    logging.info(f'Got price tables for {len(sol_prices)} mints')
+    return PriceTables(sol_prices, united_prices, buy_volumes, sell_volumes, global_quants)
+
+
+def get_dataset_keys(trades_df):
+    # get all pairs (mint, time_quant)
+    keys = trades_df[['time_quant', 'mint']].drop_duplicates()
+    # sort by mint, time_quant
+    keys.sort_values(by=['time_quant', 'mint'], inplace=True)
+    # reset index
+    keys.reset_index(drop=True, inplace=True)
+    return keys
+
+
+def assign_labels(dataset: pd.DataFrame, price_tables, forcast_timedelta, change_magnitude):
+    dataset['price'] = 0.
+    dataset['future_price'] = 0.
+    dataset['label'] = 'na'
+    price_type = 'united'
+
+    for i, row in dataset.iterrows():
+        mint = row['mint']
+        quant = row['time_quant']
+        price_now = price_tables.get_price(mint, quant, price_type)
+        assert (price_now != -1)
+        dataset.at[i, 'price'] = price_now
+        price_future = price_tables.get_price(mint, quant + forcast_timedelta, price_type)
+        if price_future == -1:
+            continue
+        dataset.at[i, 'future_price'] = price_future
+
+        if price_now == 0:
+            continue
+        if price_future > price_now * change_magnitude:
+            dataset.at[i, 'label'] = 'up'
+        elif price_future < price_now / change_magnitude:
+            dataset.at[i, 'label'] = 'down'
+        else:
+            dataset.at[i, 'label'] = 'flat'
+
+    logging.info(f'Assigned labels to {len(dataset)} records')
+    logging.info(str(dataset.label.value_counts()))
+
+
+@dataclass
+class FeatureAggr:
+    name: str
+    delta: timedelta
+    num_points: int
+
+
+class FeatureCalculator:
+
+    def __init__(
+            self,
+            dataset: pd.DataFrame,
+            price_tables: PriceTables,
+            trades_df: pd.DataFrame,
+            periods: int
+    ):
+        self.dataset = dataset
+        self.price_tables = price_tables
+        self.trades_df = trades_df
+        self.periods = periods
+
+        self.aggregations = [
+            FeatureAggr('10m', timedelta(minutes=10), self.periods),
+            FeatureAggr('1h', timedelta(hours=1), self.periods),
+            FeatureAggr('4h', timedelta(hours=4), self.periods),
+            FeatureAggr('1d', timedelta(hours=24), self.periods),
+        ]
+
+    def assign_features(self):
+        logging.info('Assigning features')
+        self.dataset['day_of_week'] = self.dataset['time_quant'].dt.dayofweek
+        self.dataset['hour'] = self.dataset['time_quant'].dt.hour
+
+        # sol price
+        # for a in self.aggregations:
+        #     self.dataset['s_price_sma_' + a.name] = [-1.] * len(self.dataset)
+        #     self.dataset['s_price_ema_' + a.name] = [-1.] * len(self.dataset)
+        #     self.dataset['s_price_rsi_' + a.name] = [-1.] * len(self.dataset)
+        #     for index, row in self.dataset.iterrows():
+        #         mint = row['mint']
+        #         time_quant = row['time_quant']
+        #         self.dataset.loc[index, 's_price_sma_' + a.name] = self.sma_price('sol', mint, time_quant, a.delta, a.num_points)
+        #         self.dataset.loc[index, 's_price_ema_' + a.name] = self.ema_price('sol', mint, time_quant, a.delta, a.num_points)
+        #         self.dataset.loc[index, 's_price_rsi_' + a.name] = self.relative_strength_index('sol', mint, time_quant, a.delta, a.num_points)
+
+        # united price
+        for a in self.aggregations:
+            self.dataset['u_price_sma_' + a.name] = [-1.] * len(self.dataset)
+            self.dataset['u_price_ema_' + a.name] = [-1.] * len(self.dataset)
+            self.dataset['u_price_rsi_' + a.name] = [-1.] * len(self.dataset)
+            for index, row in self.dataset.iterrows():
+                mint = row['mint']
+                time_quant = row['time_quant']
+                self.dataset.loc[index, 'u_price_sma_' + a.name] = self.sma_price('united', mint, time_quant, a.delta,
+                                                                             a.num_points)
+                self.dataset.loc[index, 'u_price_ema_' + a.name] = self.ema_price('united', mint, time_quant, a.delta,
+                                                                             a.num_points)
+                self.dataset.loc[index, 'u_price_rsi_' + a.name] = self.relative_strength_index('united', mint, time_quant,
+                                                                                           a.delta, a.num_points)
+
+        # volume
+        for mode in ['buy', 'sell', 'sum']:
+            for a in self.aggregations:
+                self.dataset[f'sma_vol_{mode}_{a.name}'] = [-1.] * len(self.dataset)
+                self.dataset[f'ema_vol_{mode}_{a.name}'] = [-1.] * len(self.dataset)
+                for index, row in self.dataset.iterrows():
+                    mint = row['mint']
+                    time_quant = row['time_quant']
+                    self.dataset.loc[index, f'sma_vol_{mode}_{a.name}'] = self.sma_volume(
+                        mode, mint, time_quant, a.delta, a.num_points)
+                    self.dataset.loc[index, f'ema_vol_{mode}_{a.name}'] = self.ema_volume(
+                        mode, mint, time_quant, a.delta, a.num_points)
+        logging.info('Features assigned')
+
+    def get_base_price(self, mode, inp_mint, inp_quant):
+        ans = self.price_tables.get_price(inp_mint, inp_quant, mode)
+        assert (ans != -1)
+        return ans
+
+    def get_base_volume(self, mode, inp_mint, inp_quant):
+        ans = self.price_tables.get_volume(inp_mint, inp_quant, mode)
+        assert (ans != -1)
+        return ans
+
+    def get_price_points(self, mode, inp_mint, last_quant, interval, num_points):
+        ans = []
+        for i in range(num_points):
+            quant = last_quant - i * interval
+            if quant < self.price_tables.quants[0]:
+                break
+            ans.append(self.get_base_price(mode, inp_mint, quant))
+        # reverse list
+        ans = ans[::-1]
+        return ans
+
+    def get_volume_points(self, mode, inp_mint, last_quant, interval, num_points):
+        ans = []
+        for i in range(num_points):
+            quant = last_quant - i * interval
+            prev_quant = quant - interval
+            if prev_quant < self.price_tables.quants[0]:
+                break
+            volume = self.get_base_volume(mode, inp_mint, quant)
+            prev_volume = self.get_base_volume(mode, inp_mint, prev_quant)
+            ans.append(volume - prev_volume)
+        # reverse list
+        ans = ans[::-1]
+        return ans
+
+    def sma_price(self, mode, inp_mint, last_quant, interval, num_points):
+        price_points = self.get_price_points(mode, inp_mint, last_quant, interval, num_points)
+        if len(price_points) == 0 or sum(price_points) == 0:
+            return 0.
+        return sum(price_points) / len(price_points) / self.get_base_price(mode, inp_mint, last_quant)
+
+    def ema_price(self, mode, inp_mint, last_quant, interval, num_points):
+        price_points = self.get_price_points(mode, inp_mint, last_quant, interval, num_points)
+        if len(price_points) == 0 or sum(price_points) == 0:
+            return 0.
+        k = 2 / (num_points + 1)
+        ans = price_points[0]
+        for i in range(1, len(price_points)):
+            ans = k * price_points[i] + (1 - k) * ans
+        return ans / self.get_base_price(mode, inp_mint, last_quant)
+
+    def relative_strength_index(self, mode, inp_mint, last_quant, interval, num_points):
+        price_points = self.get_price_points(mode, inp_mint, last_quant, interval, num_points)
+        if len(price_points) <= 1 or sum(price_points) == 0:
+            return -1.
+        gains = []
+        losses = []
+        for i in range(1, len(price_points)):
+            diff = price_points[i] - price_points[i - 1]
+            if diff > 0:
+                gains.append(diff)
+            elif diff < 0:
+                losses.append(-diff)
+        if len(gains) == 0:
+            return 0.
+        if len(losses) == 0:
+            return 100.
+        avg_gain = sum(gains) / len(gains)
+        avg_loss = sum(losses) / len(losses)
+        return 100 - 100 / (1 + avg_gain / avg_loss)
+
+    def sma_volume(self, mode, inp_mint, last_quant, interval, num_points):
+        volume_points = self.get_volume_points(mode, inp_mint, last_quant, interval, num_points)
+        if len(volume_points) == 0:
+            return 0.
+        return sum(volume_points) / len(volume_points)
+
+    def ema_volume(self, mode, inp_mint, last_quant, interval, num_points):
+        volume_points = self.get_volume_points(mode, inp_mint, last_quant, interval, num_points)
+        if len(volume_points) == 0:
+            return 0.
+        k = 2 / (num_points + 1)
+        ans = volume_points[0]
+        for i in range(1, len(volume_points)):
+            ans = k * volume_points[i] + (1 - k) * ans
+        return ans
+

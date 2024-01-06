@@ -1,10 +1,13 @@
-CREATE VIEW united_trades AS
+drop view if exists united_trades;
+
+CREATE OR REPLACE VIEW united_trades AS
 
 with
     st1 as (
         select
             'sol' as source,
             signature,
+            program_ids,
             timestamp,
             mint,
             token_delta,
@@ -17,6 +20,7 @@ with
     select
         'token' as source,
         signature,
+        program_ids,
         timestamp,
         mint_spent as mint,
         -amount_spent as token_delta,
@@ -31,6 +35,7 @@ with
         select
             'token' as source,
             signature,
+            program_ids,
             timestamp,
             mint_got as mint,
             amount_got as token_delta,
@@ -53,3 +58,15 @@ with
 select * from unioned;
 
 select count(*), sum(abs(sol_delta)) as vol, source from united_trades group by source;
+
+select *, -sol_delta / token_delta * 10000 from united_trades where mint = 'DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263'
+and timestamp > timestamp '2024-01-03 20:00:00' and timestamp < timestamp '2024-01-03 20:10:00'
+order by timestamp limit 100;
+
+select *, -sol_delta / token_delta * 10000 from united_trades where mint = 'DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263'
+and timestamp > timestamp '2024-01-04 08:00:00' and timestamp < timestamp '2024-01-04 08:10:00'
+order by timestamp limit 100;
+
+select * , -sol_delta / token_delta * 10000 as price from united_trades
+where mint = '14JnYcbAooDAZVb72DgmFGVZGDon5Ko4SN6ELrpU6ood'
+order by timestamp;

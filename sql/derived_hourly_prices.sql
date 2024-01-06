@@ -10,8 +10,10 @@ with hourly_raw_volumes as (
     from
         sol_trades
     where
-        abs(sol_delta) > 0.1
-        and abs(token_delta) > 0.01
+        abs(sol_delta) > 0.01
+        and array_length(program_ids, 1) = 1
+        and program_ids[1] = 'JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4'
+
     group by 1, 2
     order by 1 desc, 2
 ),
@@ -27,7 +29,7 @@ select count(*) as hours, mint,
        max(sol_price) / min(sol_price) as price_range
        from hourly_semi_raw_prices
 where
-    sol_delta > 50
+    sol_delta > 10
     and num_trades > 5
 group by mint
 order by hours desc
@@ -53,6 +55,10 @@ hourly_prices_final as (
 select * from hourly_prices_final;
 
 select * from hourly_prices_final_view;
+
+select distinct mint from hourly_prices_final_view;
+
+select mint, count(*) from hourly_prices_final_view group by mint;
 
 -- select count(*), sum(sol_price * token_trades.amount_spent) from token_trades
 -- join hourly_prices_final on
