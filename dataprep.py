@@ -37,7 +37,7 @@ class DatasetBuilder:
         trades_df = filter_by_program_id(trades_df)
         logging.info(f'Using memory: {trades_df.memory_usage(deep=True).sum() / 1024 ** 2} MB')
         add_time_quantization(trades_df)
-        trades_df = remove_rare_tokens(trades_df)
+        # trades_df = remove_rare_tokens(trades_df)
         trades_df = remove_latest_and_first_quant(trades_df)
         price_tables = get_price_tables(trades_df)
         self.price_tables = price_tables
@@ -59,6 +59,7 @@ class DatasetBuilder:
         self.change_magnitude = change_magnitude
         assign_labels(self.dataset, self.price_tables, self.buy_timedelta, self.sell_interval, self.change_magnitude)
         return self.dataset
+
 
 def get_db_df(rows_limit):
     logging.info('Getting data from db')
@@ -145,52 +146,65 @@ def remove_latest_and_first_quant(trades_df):
 
 
 class PriceTables:
-    quants: pd.DatetimeIndex
+    global_quants: pd.DatetimeIndex
+    token_quants: Dict[str, pd.DatetimeIndex]
     sol_prices: Dict[str, np.array]
     united_prices: Dict[str, np.array]
     buy_volumes: Dict[str, np.array]
     sell_volumes: Dict[str, np.array]
 
-    def __init__(self, sol_prices, united_prices, buy_volumes, sell_volumes, quants):
+    def __init__(self, sol_prices, united_prices, buy_volumes, sell_volumes, token_quants, global_quants):
         self.sol_prices = sol_prices
         self.united_prices = united_prices
         self.buy_volumes = buy_volumes
         self.sell_volumes = sell_volumes
-        self.quants = quants
+        self.token_quants = token_quants
+        self.global_quants = global_quants
 
-    def get_price(self, mint, quant, price_type):
-        quant_index_float = (quant - self.quants[0]) / QUANT_TIMEDELTA
+    @staticmethod
+    def get_quant_index(quant, quant_list):
+        quant_index_float = (quant - quant_list[0]) / QUANT_TIMEDELTA
         # convert to int, but check that it's close to integer
         quant_index = round(quant_index_float)
         if abs(quant_index_float - quant_index) > 0.01:
             raise ValueError(f'Quant {quant} is not close to quantization')
+        return quant_index
 
-        if quant_index < 0 or quant_index >= len(self.quants):
+    def get_price(self, mint, quant, price_type):
+        global_quant_index = self.get_quant_index(quant, self.global_quants)
+        if global_quant_index < 0 or global_quant_index >= len(self.global_quants):
             return -1
 
+        token_quant_index = self.get_quant_index(quant, self.token_quants[mint])
+        if token_quant_index < 0:
+            return 0.
+        if token_quant_index >= len(self.token_quants[mint]):
+            token_quant_index = len(self.token_quants[mint]) - 1
+
         if price_type == 'sol':
-            return self.sol_prices[mint][quant_index]
+            return self.sol_prices[mint][token_quant_index]
         elif price_type == 'united':
-            return self.united_prices[mint][quant_index]
+            return self.united_prices[mint][token_quant_index]
         else:
             raise ValueError(f'Unknown price type: {price_type}')
 
     def get_volume(self, mint, quant, price_type):
-        quant_index_float = (quant - self.quants[0]) / QUANT_TIMEDELTA
-        # convert to int, but check that it's close to integer
-        quant_index = round(quant_index_float)
-        if abs(quant_index_float - quant_index) > 0.01:
-            raise ValueError(f'Quant {quant} is not close to quantization')
-
-        if quant_index < 0 or quant_index >= len(self.quants):
+        global_quant_index = self.get_quant_index(quant, self.global_quants)
+        if global_quant_index < 0 or global_quant_index >= len(self.global_quants):
             return -1
 
+        token_quant_index = self.get_quant_index(quant, self.token_quants[mint])
+        if token_quant_index < 0:
+            return 0.
+        if token_quant_index >= len(self.token_quants[mint]):
+            token_quant_index = len(self.token_quants[mint]) - 1
+
         if price_type == 'buy':
-            return self.buy_volumes[mint][quant_index]
+            return self.buy_volumes[mint][token_quant_index]
         elif price_type == 'sell':
-            return self.sell_volumes[mint][quant_index]
+            return self.sell_volumes[mint][token_quant_index]
         elif price_type == 'sum':
-            return self.buy_volumes[mint][quant_index] + self.sell_volumes[mint][quant_index]
+            return self.buy_volumes[mint][token_quant_index] + self.sell_volumes[mint][token_quant_index]
         else:
             raise ValueError(f'Unknown volume type: {price_type}')
 
@@ -226,23 +240,18 @@ def get_buy_sell_volume(df) -> (float, float):
     return buy_volume, sell_volume
 
 def get_price_tables(trades_df) -> PriceTables:
-    min_quant = trades_df.time_quant.min()
-    max_quant = trades_df.time_quant.max()
-    global_quants = pd.date_range(min_quant, max_quant, freq=TIME_QUANTIZATION)
-    quants_len = len(global_quants)
+    min_global_quant = trades_df.time_quant.min()
+    max_global_quant = trades_df.time_quant.max()
+    global_quants = pd.date_range(min_global_quant, max_global_quant, freq=TIME_QUANTIZATION)
 
     trades_df.sort_values(by=['mint', 'time_quant'], inplace=True)
     sol_prices = {}
     united_prices = {}
     buy_volumes = {}
     sell_volumes = {}
+    token_quants = {}
 
     for mint in trades_df.mint.unique():
-        sol_prices[mint] = np.zeros(quants_len)
-        united_prices[mint] = np.zeros(quants_len)
-        buy_volumes[mint] = np.zeros(quants_len)
-        sell_volumes[mint] = np.zeros(quants_len)
-
         mint_df = trades_df[trades_df.mint == mint]
         mint_df.set_index('time_quant', inplace=True)
         last_sol_price = 0.
@@ -250,7 +259,18 @@ def get_price_tables(trades_df) -> PriceTables:
         buy_volume_cumsum = 0.
         sell_volume_cumsum = 0.
         quants_in_df = mint_df.index.unique()
-        for i, quant in enumerate(global_quants):
+
+        min_token_quant = min(quants_in_df)
+        max_token_quant = max(quants_in_df)
+        token_quants[mint] = pd.date_range(min_token_quant, max_token_quant, freq=TIME_QUANTIZATION)
+        token_quants_len = len(token_quants[mint])
+
+        sol_prices[mint] = np.zeros(token_quants_len)
+        united_prices[mint] = np.zeros(token_quants_len)
+        buy_volumes[mint] = np.zeros(token_quants_len)
+        sell_volumes[mint] = np.zeros(token_quants_len)
+
+        for i, quant in enumerate(token_quants[mint]):
             if quant in quants_in_df:
                 # mint_quant_df = mint_df[['source', 'sol_delta', 'token_delta']].loc[[quant]]
                 mint_quant_df = mint_df.loc[[quant]]
@@ -268,7 +288,7 @@ def get_price_tables(trades_df) -> PriceTables:
             buy_volumes[mint][i] = buy_volume_cumsum
             sell_volumes[mint][i] = sell_volume_cumsum
     logging.info(f'Got price tables for {len(sol_prices)} mints')
-    return PriceTables(sol_prices, united_prices, buy_volumes, sell_volumes, global_quants)
+    return PriceTables(sol_prices, united_prices, buy_volumes, sell_volumes, token_quants, global_quants)
 
 
 def get_dataset_keys(trades_df):
@@ -334,6 +354,29 @@ def assign_labels(
     logging.info(str(dataset.label.value_counts()))
 
 
+def cache_decorator(func):
+    cached_key = None
+    cached_result = None
+
+    def wrapper(*args, **kwargs):
+        nonlocal cached_key, cached_result
+
+        # Create a key from the arguments and keyword arguments
+        current_key = (args, tuple(kwargs.items()))
+
+        # Check if the current arguments match the cached key
+        if current_key == cached_key:
+            return cached_result
+
+        # Call the function and update the cache
+        cached_result = func(*args, **kwargs)
+        cached_key = current_key
+
+        return cached_result
+
+    return wrapper
+
+
 @dataclass
 class FeatureAggr:
     name: str
@@ -387,12 +430,9 @@ class FeatureCalculator:
             for index, row in self.dataset.iterrows():
                 mint = row['mint']
                 time_quant = row['time_quant']
-                self.dataset.loc[index, 'u_price_sma_' + a.name] = self.sma_price('united', mint, time_quant, a.delta,
-                                                                             a.num_points)
-                self.dataset.loc[index, 'u_price_ema_' + a.name] = self.ema_price('united', mint, time_quant, a.delta,
-                                                                             a.num_points)
-                self.dataset.loc[index, 'u_price_rsi_' + a.name] = self.relative_strength_index('united', mint, time_quant,
-                                                                                           a.delta, a.num_points)
+                self.dataset.loc[index, 'u_price_sma_' + a.name] = self.sma_price('united', mint, time_quant, a.delta, a.num_points)
+                self.dataset.loc[index, 'u_price_ema_' + a.name] = self.ema_price('united', mint, time_quant, a.delta, a.num_points)
+                self.dataset.loc[index, 'u_price_rsi_' + a.name] = self.relative_strength_index('united', mint, time_quant, a.delta, a.num_points)
 
         # volume
         for mode in ['buy', 'sell', 'sum']:
@@ -418,23 +458,25 @@ class FeatureCalculator:
         assert (ans != -1)
         return ans
 
+    @cache_decorator
     def get_price_points(self, mode, inp_mint, last_quant, interval, num_points):
         ans = []
         for i in range(num_points):
             quant = last_quant - i * interval
-            if quant < self.price_tables.quants[0]:
+            if quant < self.price_tables.global_quants[0]:
                 break
             ans.append(self.get_base_price(mode, inp_mint, quant))
         # reverse list
         ans = ans[::-1]
         return ans
 
+    @cache_decorator
     def get_volume_points(self, mode, inp_mint, last_quant, interval, num_points):
         ans = []
         for i in range(num_points):
             quant = last_quant - i * interval
             prev_quant = quant - interval
-            if prev_quant < self.price_tables.quants[0]:
+            if prev_quant < self.price_tables.global_quants[0]:
                 break
             volume = self.get_base_volume(mode, inp_mint, quant)
             prev_volume = self.get_base_volume(mode, inp_mint, prev_quant)
