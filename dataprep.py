@@ -19,9 +19,15 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 
 
 class DatasetBuilder:
-    def __init__(self, rows_limit: int, prediction_timedelta: timedelta, change_magnitude: float):
+    def __init__(self,
+                 rows_limit: int,
+                 buy_timedelta: timedelta,
+                 sell_interval: (timedelta, timedelta),
+                 change_magnitude: float
+                 ):
         self.rows_limit = rows_limit
-        self.prediction_timedelta = prediction_timedelta
+        self.buy_timedelta = buy_timedelta
+        self.sell_interval = sell_interval
         self.change_magnitude = change_magnitude
         self.price_tables = None
         self.dataset = None
@@ -36,7 +42,7 @@ class DatasetBuilder:
         price_tables = get_price_tables(trades_df)
         self.price_tables = price_tables
         dataset = get_dataset_keys(trades_df)
-        assign_labels(dataset, price_tables, self.prediction_timedelta, self.change_magnitude)
+        assign_labels(dataset, price_tables, self.buy_timedelta, self.sell_interval, self.change_magnitude)
         feature_calculator = FeatureCalculator(dataset, price_tables, trades_df, periods=14)
         feature_calculator.assign_features()
         dataset.sort_values(by=['time_quant', 'mint'], inplace=True)
@@ -44,10 +50,14 @@ class DatasetBuilder:
         self.dataset = dataset
         return dataset
 
-    def reassign_values(self, prediction_timedelta: timedelta, change_magnitude: float):
-        self.prediction_timedelta = prediction_timedelta
+    def reassign_values(self,
+                        buy_timedelta: timedelta,
+                        sell_interval: (timedelta, timedelta),
+                        change_magnitude: float):
+        self.buy_timedelta = buy_timedelta
+        self.sell_interval = sell_interval
         self.change_magnitude = change_magnitude
-        assign_labels(self.dataset, self.price_tables, self.prediction_timedelta, self.change_magnitude)
+        assign_labels(self.dataset, self.price_tables, self.buy_timedelta, self.sell_interval, self.change_magnitude)
         return self.dataset
 
 def get_db_df(rows_limit):
@@ -271,28 +281,51 @@ def get_dataset_keys(trades_df):
     return keys
 
 
-def assign_labels(dataset: pd.DataFrame, price_tables, forcast_timedelta, change_magnitude):
+def assign_labels(
+        dataset: pd.DataFrame,
+        price_tables,
+        buy_timedelta: timedelta,
+        sell_interval: (timedelta, timedelta),
+        change_magnitude):
     dataset['price'] = 0.
-    dataset['future_price'] = 0.
+    dataset['buy_price'] = 0.
+    dataset['sell_price'] = 0.
     dataset['label'] = 'na'
     price_type = 'united'
 
     for i, row in dataset.iterrows():
         mint = row['mint']
         quant = row['time_quant']
-        price_now = price_tables.get_price(mint, quant, price_type)
-        assert (price_now != -1)
-        dataset.at[i, 'price'] = price_now
-        price_future = price_tables.get_price(mint, quant + forcast_timedelta, price_type)
-        if price_future == -1:
+        # price now
+        now_price = price_tables.get_price(mint, quant, price_type)
+        assert (now_price != -1)
+        dataset.at[i, 'price'] = now_price
+        # price after buy_timedelta
+        buy_price = price_tables.get_price(mint, quant + buy_timedelta, price_type)
+        if buy_price == -1:
             continue
-        dataset.at[i, 'future_price'] = price_future
+        dataset.at[i, 'buy_price'] = buy_price
+        # check that latest sell price exists
+        latest_sell_price = price_tables.get_price(mint, quant + sell_interval[1], price_type)
+        if latest_sell_price == -1:
+            continue
 
-        if price_now == 0:
+        sell_prices = []
+        for sell_quant in pd.date_range(quant + sell_interval[0], quant + sell_interval[1], freq=QUANT_TIMEDELTA):
+            sell_price = price_tables.get_price(mint, sell_quant, price_type)
+            assert (sell_price != -1)
+            sell_prices.append(sell_price)
+
+        assert (len(sell_prices) > 0)
+        sell_price = np.average(sell_prices)
+
+        dataset.at[i, 'sell_price'] = sell_price
+
+        if now_price == 0:
             continue
-        if price_future > price_now * change_magnitude:
+        if sell_price > buy_price * change_magnitude:
             dataset.at[i, 'label'] = 'up'
-        elif price_future < price_now / change_magnitude:
+        elif sell_price < buy_price / change_magnitude:
             dataset.at[i, 'label'] = 'down'
         else:
             dataset.at[i, 'label'] = 'flat'
