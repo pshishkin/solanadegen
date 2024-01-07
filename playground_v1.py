@@ -623,7 +623,7 @@ def loop_process_individual_trades():
     while True:
         processed = process_individual_trades()
         if processed == 0:
-            break
+            sleep(10)
 
 
 def process_individual_trades():
