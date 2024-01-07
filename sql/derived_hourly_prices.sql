@@ -67,3 +67,5 @@ select mint, count(*) from hourly_prices_final_view group by mint;
 
 -- select sum(abs(sol_delta)) from sol_trades
 --where mint in (select mint from filtered_tokens);
+
+show database;

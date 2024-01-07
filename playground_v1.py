@@ -123,6 +123,7 @@ def get_unprocessed_individual_transactions(cur, batch_size=TRADES_BATCH):
     WHERE processed = FALSE 
     AND bucket < %s
     and timestamp < now() - interval '3 minute'
+    and timestamp > timestamp '2023-12-01'
     ORDER BY timestamp DESC 
     LIMIT %s
     """
