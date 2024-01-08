@@ -152,12 +152,16 @@ class PriceTables:
     united_prices: Dict[str, np.array]
     buy_volumes: Dict[str, np.array]
     sell_volumes: Dict[str, np.array]
+    buy_cnts: Dict[str, np.array]
+    sell_cnts: Dict[str, np.array]
 
-    def __init__(self, sol_prices, united_prices, buy_volumes, sell_volumes, token_quants, global_quants):
+    def __init__(self, sol_prices, united_prices, buy_volumes, sell_volumes, buy_cnts, sell_cnts, token_quants, global_quants):
         self.sol_prices = sol_prices
         self.united_prices = united_prices
         self.buy_volumes = buy_volumes
         self.sell_volumes = sell_volumes
+        self.buy_cnts = buy_cnts
+        self.sell_cnts = sell_cnts
         self.token_quants = token_quants
         self.global_quants = global_quants
 
@@ -208,6 +212,26 @@ class PriceTables:
         else:
             raise ValueError(f'Unknown volume type: {price_type}')
 
+    def get_trades_cnt(self, mint, quant, price_type):
+        global_quant_index = self.get_quant_index(quant, self.global_quants)
+        if global_quant_index < 0 or global_quant_index >= len(self.global_quants):
+            return -1
+
+        token_quant_index = self.get_quant_index(quant, self.token_quants[mint])
+        if token_quant_index < 0:
+            return 0.
+        if token_quant_index >= len(self.token_quants[mint]):
+            token_quant_index = len(self.token_quants[mint]) - 1
+
+        if price_type == 'buy':
+            return self.buy_cnts[mint][token_quant_index]
+        elif price_type == 'sell':
+            return self.sell_cnts[mint][token_quant_index]
+        elif price_type == 'sum':
+            return self.buy_cnts[mint][token_quant_index] + self.sell_cnts[mint][token_quant_index]
+        else:
+            raise ValueError(f'Unknown volume type: {price_type}')
+
 
 def get_exponential_price_average(df, alpha=0.5) -> float:
     # calculates exponential moving average of price,
@@ -239,6 +263,20 @@ def get_buy_sell_volume(df) -> (float, float):
 
     return buy_volume, sell_volume
 
+
+def get_buy_sell_cnt(df) -> (float, float):
+    buy_cnt = 0.
+    sell_cnt = 0.
+
+    for i, row in df.iterrows():
+        if row['sol_delta'] > 0:
+            buy_cnt += 1
+        if row['sol_delta'] < 0:
+            sell_cnt += 1
+
+    return buy_cnt, sell_cnt
+
+
 def get_price_tables(trades_df) -> PriceTables:
     min_global_quant = trades_df.time_quant.min()
     max_global_quant = trades_df.time_quant.max()
@@ -249,6 +287,8 @@ def get_price_tables(trades_df) -> PriceTables:
     united_prices = {}
     buy_volumes = {}
     sell_volumes = {}
+    buy_cnts = {}
+    sell_cnts = {}
     token_quants = {}
 
     for mint in trades_df.mint.unique():
@@ -258,6 +298,8 @@ def get_price_tables(trades_df) -> PriceTables:
         last_united_price = 0.
         buy_volume_cumsum = 0.
         sell_volume_cumsum = 0.
+        buy_cnt_cumsum = 0
+        sell_cnt_cumsum = 0
         quants_in_df = mint_df.index.unique()
 
         min_token_quant = min(quants_in_df)
@@ -269,6 +311,8 @@ def get_price_tables(trades_df) -> PriceTables:
         united_prices[mint] = np.zeros(token_quants_len)
         buy_volumes[mint] = np.zeros(token_quants_len)
         sell_volumes[mint] = np.zeros(token_quants_len)
+        buy_cnts[mint] = np.zeros(token_quants_len)
+        sell_cnts[mint] = np.zeros(token_quants_len)
 
         for i, quant in enumerate(token_quants[mint]):
             if quant in quants_in_df:
@@ -278,6 +322,9 @@ def get_price_tables(trades_df) -> PriceTables:
                 buy_volume, sell_volume = get_buy_sell_volume(mint_quant_df)
                 buy_volume_cumsum += buy_volume
                 sell_volume_cumsum += sell_volume
+                buy_cnt, sell_cnt = get_buy_sell_cnt(mint_quant_df)
+                buy_cnt_cumsum += buy_cnt
+                sell_cnt_cumsum += sell_cnt
                 # get only sol trades which means source is 'sol
                 sol_df = mint_quant_df[mint_quant_df['source'] == 'sol']
                 # if it's non-empty, calc price
@@ -287,8 +334,13 @@ def get_price_tables(trades_df) -> PriceTables:
             united_prices[mint][i] = last_united_price
             buy_volumes[mint][i] = buy_volume_cumsum
             sell_volumes[mint][i] = sell_volume_cumsum
+            buy_cnts[mint][i] = buy_cnt_cumsum
+            sell_cnts[mint][i] = sell_cnt_cumsum
     logging.info(f'Got price tables for {len(sol_prices)} mints')
-    return PriceTables(sol_prices, united_prices, buy_volumes, sell_volumes, token_quants, global_quants)
+    return PriceTables(sol_prices, united_prices,
+                       buy_volumes, sell_volumes,
+                       buy_cnts, sell_cnts,
+                       token_quants, global_quants)
 
 
 def get_dataset_keys(trades_df):
@@ -399,6 +451,7 @@ class FeatureCalculator:
         self.periods = periods
 
         self.aggregations = [
+            FeatureAggr('now', timedelta(minutes=10), 1),
             FeatureAggr('10m', timedelta(minutes=10), self.periods),
             FeatureAggr('1h', timedelta(hours=1), self.periods),
             FeatureAggr('4h', timedelta(hours=4), self.periods),
@@ -410,41 +463,35 @@ class FeatureCalculator:
         self.dataset['day_of_week'] = self.dataset['time_quant'].dt.dayofweek
         self.dataset['hour'] = self.dataset['time_quant'].dt.hour
 
-        # sol price
-        # for a in self.aggregations:
-        #     self.dataset['s_price_sma_' + a.name] = [-1.] * len(self.dataset)
-        #     self.dataset['s_price_ema_' + a.name] = [-1.] * len(self.dataset)
-        #     self.dataset['s_price_rsi_' + a.name] = [-1.] * len(self.dataset)
-        #     for index, row in self.dataset.iterrows():
-        #         mint = row['mint']
-        #         time_quant = row['time_quant']
-        #         self.dataset.loc[index, 's_price_sma_' + a.name] = self.sma_price('sol', mint, time_quant, a.delta, a.num_points)
-        #         self.dataset.loc[index, 's_price_ema_' + a.name] = self.ema_price('sol', mint, time_quant, a.delta, a.num_points)
-        #         self.dataset.loc[index, 's_price_rsi_' + a.name] = self.relative_strength_index('sol', mint, time_quant, a.delta, a.num_points)
-
         # united price
         for a in self.aggregations:
-            self.dataset['u_price_sma_' + a.name] = [-1.] * len(self.dataset)
-            self.dataset['u_price_ema_' + a.name] = [-1.] * len(self.dataset)
-            self.dataset['u_price_rsi_' + a.name] = [-1.] * len(self.dataset)
-            for index, row in self.dataset.iterrows():
-                mint = row['mint']
-                time_quant = row['time_quant']
-                self.dataset.loc[index, 'u_price_sma_' + a.name] = self.sma_price('united', mint, time_quant, a.delta, a.num_points)
-                self.dataset.loc[index, 'u_price_ema_' + a.name] = self.ema_price('united', mint, time_quant, a.delta, a.num_points)
-                self.dataset.loc[index, 'u_price_rsi_' + a.name] = self.relative_strength_index('united', mint, time_quant, a.delta, a.num_points)
+            for trunc in ['', '_trunc']:
+                self.dataset['found_points_' + a.name + trunc] = [-1.] * len(self.dataset)
+                self.dataset['u_price_sma_' + a.name + trunc] = [-1.] * len(self.dataset)
+                self.dataset['u_price_ema_' + a.name + trunc] = [-1.] * len(self.dataset)
+                self.dataset['u_price_rsi_' + a.name + trunc] = [-1.] * len(self.dataset)
+                for index, row in self.dataset.iterrows():
+                    mint = row['mint']
+                    time_quant = row['time_quant']
+                    self.dataset.loc[index, 'found_points_' + a.name + trunc] = self.found_points('united', trunc, mint, time_quant, a.delta, a.num_points)
+                    self.dataset.loc[index, 'u_price_sma_' + a.name + trunc] = self.sma_price('united', trunc, mint, time_quant, a.delta, a.num_points)
+                    self.dataset.loc[index, 'u_price_ema_' + a.name + trunc] = self.ema_price('united', trunc, mint, time_quant, a.delta, a.num_points)
+                    self.dataset.loc[index, 'u_price_rsi_' + a.name + trunc] = self.relative_strength_index('united', trunc, mint, time_quant, a.delta, a.num_points)
 
         # volume
         for mode in ['buy', 'sell', 'sum']:
             for a in self.aggregations:
-                self.dataset[f'sma_vol_{mode}_{a.name}'] = [-1.] * len(self.dataset)
-                self.dataset[f'ema_vol_{mode}_{a.name}'] = [-1.] * len(self.dataset)
+                self.dataset[f'trcnt_sma_{mode}_{a.name}'] = [-1.] * len(self.dataset)
+                self.dataset[f'vol_sma_{mode}_{a.name}'] = [-1.] * len(self.dataset)
+                self.dataset[f'vol_ema_{mode}_{a.name}'] = [-1.] * len(self.dataset)
                 for index, row in self.dataset.iterrows():
                     mint = row['mint']
                     time_quant = row['time_quant']
-                    self.dataset.loc[index, f'sma_vol_{mode}_{a.name}'] = self.sma_volume(
+                    self.dataset.loc[index, f'trcnt_sma_{mode}_{a.name}'] = self.sma_trades(
                         mode, mint, time_quant, a.delta, a.num_points)
-                    self.dataset.loc[index, f'ema_vol_{mode}_{a.name}'] = self.ema_volume(
+                    self.dataset.loc[index, f'vol_sma_{mode}_{a.name}'] = self.sma_volume(
+                        mode, mint, time_quant, a.delta, a.num_points)
+                    self.dataset.loc[index, f'vol_ema_{mode}_{a.name}'] = self.ema_volume(
                         mode, mint, time_quant, a.delta, a.num_points)
         logging.info('Features assigned')
 
@@ -458,12 +505,21 @@ class FeatureCalculator:
         assert (ans != -1)
         return ans
 
+    def get_base_trades_cnt(self, mode, inp_mint, inp_quant):
+        ans = self.price_tables.get_trades_cnt(inp_mint, inp_quant, mode)
+        assert (ans != -1)
+        return ans
+
     @cache_decorator
-    def get_price_points(self, mode, inp_mint, last_quant, interval, num_points):
+    def get_price_points(self, mode, trunc, inp_mint, last_quant, interval, num_points):
+        if trunc not in ['', '_trunc']:
+            raise ValueError(f'Unknown trunc: "{trunc}"')
         ans = []
         for i in range(num_points):
             quant = last_quant - i * interval
             if quant < self.price_tables.global_quants[0]:
+                break
+            if trunc == '_trunc' and quant < self.price_tables.token_quants[inp_mint][0]:
                 break
             ans.append(self.get_base_price(mode, inp_mint, quant))
         # reverse list
@@ -485,14 +541,33 @@ class FeatureCalculator:
         ans = ans[::-1]
         return ans
 
-    def sma_price(self, mode, inp_mint, last_quant, interval, num_points):
-        price_points = self.get_price_points(mode, inp_mint, last_quant, interval, num_points)
+    @cache_decorator
+    def get_trade_cnt_points(self, mode, inp_mint, last_quant, interval, num_points):
+        ans = []
+        for i in range(num_points):
+            quant = last_quant - i * interval
+            prev_quant = quant - interval
+            if prev_quant < self.price_tables.global_quants[0]:
+                break
+            trades = self.get_base_trades_cnt(mode, inp_mint, quant)
+            prev_trades = self.get_base_trades_cnt(mode, inp_mint, prev_quant)
+            ans.append(trades - prev_trades)
+        # reverse list
+        ans = ans[::-1]
+        return ans
+
+    def found_points(self, mode, trunc, inp_mint, last_quant, interval, num_points):
+        price_points = self.get_price_points(mode, trunc, inp_mint, last_quant, interval, num_points)
+        return len(price_points)
+
+    def sma_price(self, mode, trunc, inp_mint, last_quant, interval, num_points):
+        price_points = self.get_price_points(mode, trunc, inp_mint, last_quant, interval, num_points)
         if len(price_points) == 0 or sum(price_points) == 0:
             return 0.
         return sum(price_points) / len(price_points) / self.get_base_price(mode, inp_mint, last_quant)
 
-    def ema_price(self, mode, inp_mint, last_quant, interval, num_points):
-        price_points = self.get_price_points(mode, inp_mint, last_quant, interval, num_points)
+    def ema_price(self, mode, trunc, inp_mint, last_quant, interval, num_points):
+        price_points = self.get_price_points(mode, trunc, inp_mint, last_quant, interval, num_points)
         if len(price_points) == 0 or sum(price_points) == 0:
             return 0.
         k = 2 / (num_points + 1)
@@ -501,8 +576,8 @@ class FeatureCalculator:
             ans = k * price_points[i] + (1 - k) * ans
         return ans / self.get_base_price(mode, inp_mint, last_quant)
 
-    def relative_strength_index(self, mode, inp_mint, last_quant, interval, num_points):
-        price_points = self.get_price_points(mode, inp_mint, last_quant, interval, num_points)
+    def relative_strength_index(self, mode, trunc, inp_mint, last_quant, interval, num_points):
+        price_points = self.get_price_points(mode, trunc, inp_mint, last_quant, interval, num_points)
         if len(price_points) <= 1 or sum(price_points) == 0:
             return -1.
         gains = []
@@ -520,6 +595,12 @@ class FeatureCalculator:
         avg_gain = sum(gains) / len(gains)
         avg_loss = sum(losses) / len(losses)
         return 100 - 100 / (1 + avg_gain / avg_loss)
+
+    def sma_trades(self, mode, inp_mint, last_quant, interval, num_points):
+        trade_points = self.get_trade_cnt_points(mode, inp_mint, last_quant, interval, num_points)
+        if len(trade_points) == 0:
+            return 0.
+        return sum(trade_points) / len(trade_points)
 
     def sma_volume(self, mode, inp_mint, last_quant, interval, num_points):
         volume_points = self.get_volume_points(mode, inp_mint, last_quant, interval, num_points)
